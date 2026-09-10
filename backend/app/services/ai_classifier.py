@@ -74,12 +74,23 @@ def fallback_parse_filename(
     # Limpiar prefijos numéricos típicos (ej: "01 - ", "[01] ")
     clean_name = re.sub(r"^(\d+[\s\-_.]+|\[\d+\]\s*|\(\d+\)\s*)", "", name_no_ext).strip()
 
-    parts = re.split(r"\s*[-–—]\s*", clean_name)
     title = clean_name.replace("_", " ").title()
     author = "Desconocido"
+
+    # 1. Separación por delimitadores explícitos: " - ", " – ", " — ", " by ", " por "
+    parts = re.split(r"\s*(?:[-–—]|(?:\s+by\s+)|\s+por\s+)\s*", clean_name, flags=re.IGNORECASE)
     if len(parts) >= 2:
         title = parts[0].strip().replace("_", " ").title()
         author = parts[1].strip().replace("_", " ").title()
+    else:
+        # 2. Heurística posicional si no hay guiones (ej: "La Tregua Mario Benedetti")
+        words = clean_name.split()
+        if len(words) >= 4:
+            title = " ".join(words[:-2]).strip().replace("_", " ").title()
+            author = " ".join(words[-2:]).strip().replace("_", " ").title()
+        elif len(words) == 3:
+            title = " ".join(words[:2]).strip().replace("_", " ").title()
+            author = words[2].strip().replace("_", " ").title()
 
     # Helper local para comparar texto normalizado
     import unicodedata
@@ -140,8 +151,8 @@ async def classify_book_with_gemini(
     """
     Clasifica un libro y extrae metadata limpia (título, autor, género) usando Google Gemini.
     Tiene en cuenta los temas ya existentes en el grupo para no duplicar.
-    Detecta activamente si un libro está en el tema incorrecto para reubicarlo.
-    Maneja reintentos con backoff para evitar saturación de cuota HTTP 429.
+    Detecta activamente autores tanto en el nombre del archivo como por cultura literaria.
+    Implementa una cascada multi-modelo para evitar cuellos de botella por cuotas (429/503).
     """
     if not settings.GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY no configurada. Usando parser heurístico.")
@@ -160,9 +171,14 @@ Analiza este libro que acaba de ser subido:
 Lista de Temas (Topics) YA CREADOS en el grupo de Telegram:
 {topics_formatted}
 
-INSTRUCCIONES DE CLASIFICACIÓN:
-1. Identifica el Título real del libro. Elimina numeraciones iniciales de saga (ej: "01 - ", "[Vol 1] "), extensiones o tags de escaneo.
-2. Identifica el Autor real del libro. Si no se puede deducir del nombre, pon "Desconocido".
+INSTRUCCIONES DE CLASIFICACIÓN Y EXTRACCIÓN:
+1. Identifica el TÍTULO real del libro:
+   - Limpia numeraciones iniciales de saga (ej: "01 - ", "[Vol 1] "), extensiones o tags de escaneo.
+   - Si el archivo contiene el nombre del autor mezclado con el título (ej: "La Tregua Mario Benedetti" o "El Gran Gatsby Francis Scott Fitzgerald"), SEPARA limpiamente el título del autor. El título es solo el nombre de la obra.
+2. Identifica el AUTOR real del libro:
+   - Sé muy exhaustivo. Si el nombre del autor aparece en el archivo (al final, al inicio, con o sin guión, ej: "Mario Benedetti", "Francis Scott Fitzgerald", "Eva Winners"), extráelo limpiamente.
+   - Si reconoces la obra literaria (clásica o contemporánea), asigna el autor correspondiente según tu conocimiento cultural de la obra.
+   - NUNCA pongas "Desconocido" si el autor es deducible del texto o si es una obra conocida.
 3. Determina el Género literario exacto del libro de forma OBJETIVA:
    - ATENCIÓN - DETECCIÓN DE TEMA ERRÓNEO: Los usuarios con frecuencia suben libros en el tema equivocado (por ejemplo, suben un libro de 'Fantasía' o 'Thriller' en el tema de 'Romance'). NO te limites ni asumas que el tema donde fue encontrado es el correcto.
    - Si el libro pertenece a otro de los 'Temas YA CREADOS' en la lista (por ejemplo, es Fantasía y existe el tema Fantasía), DEBES elegir EXACTAMENTE ese nombre para que el bot pueda reubicarlo automáticamente.
@@ -179,20 +195,27 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
 }}
 """
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.1,
-            "thinkingConfig": {
-                "thinkingBudget": 512
+    # Cadena de modelos de respaldo para garantizar alta disponibilidad
+    models_to_try = [
+        settings.GEMINI_MODEL,
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash"
+    ]
+    # Eliminar duplicados manteniendo orden
+    seen_models = set()
+    model_chain = [m for m in models_to_try if not (m in seen_models or seen_models.add(m))]
+
+    for model in model_chain:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.1
             }
         }
-    }
 
-    max_retries = 2
-    for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(url, json=payload)
@@ -202,25 +225,26 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
                     parsed = json.loads(candidate_text)
                     genre = parsed.get("genre", current_topic_hint or "General")
                     emoji = get_genre_emoji(genre, parsed.get("emoji"))
-                    logger.info(f"Gemini clasificó exitosamente: {parsed}")
+                    author = parsed.get("author", "Desconocido")
+                    logger.info(f"Gemini ({model}) clasificó exitosamente: {parsed}")
                     return {
                         "title": parsed.get("title", filename),
-                        "author": parsed.get("author", "Desconocido"),
+                        "author": author if author and author.strip() else "Desconocido",
                         "genre": genre,
                         "emoji": emoji
                     }
-                elif response.status_code == 429 and attempt < max_retries - 1:
-                    logger.warning(f"Rate limit 429 en Gemini API. Esperando 2.5s antes de reintentar (intento {attempt + 1}/{max_retries})...")
-                    await asyncio.sleep(2.5)
+                elif response.status_code in (429, 503):
+                    logger.warning(f"Modelo {model} ocupado/limitado ({response.status_code}). Probando siguiente modelo de la cadena...")
                     continue
                 else:
-                    logger.warning(f"Error en Gemini API ({response.status_code}): {response.text}")
-                    break
+                    logger.warning(f"Error en Gemini {model} ({response.status_code}): {response.text}")
+                    continue
         except Exception as e:
-            logger.error(f"Excepción al consultar Gemini API: {e}")
-            break
+            logger.warning(f"Excepción al consultar modelo {model}: {e}. Probando siguiente modelo...")
+            continue
 
-    # Fallback si la IA falla
+    # Fallback si todos los modelos de IA fallan
+    logger.warning("Todos los modelos de Gemini fallaron o agotaron cuota. Usando parser heurístico de respaldo.")
     return fallback_parse_filename(
         filename=filename,
         existing_topics=existing_topics,

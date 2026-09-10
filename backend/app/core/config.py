@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     
     # AI Classifier (Google Gemini)
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-3.6-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
     # Database
     DATABASE_URL: str = f"sqlite+aiosqlite:///{BASE_DIR}/librosync.db"

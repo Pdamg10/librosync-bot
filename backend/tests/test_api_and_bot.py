@@ -267,8 +267,9 @@ async def test_gemini_retry_on_429():
         mock_client_cls.return_value.__aenter__.return_value = mock_client
         res = await classify_book_with_gemini("Cien Años de Soledad.epub")
         assert res["title"] == "Cien Años de Soledad"
+        assert res["author"] == "Gabriel García Márquez"
         assert res["genre"] == "Fantasía"
-        assert mock_sleep.called
+        assert mock_client.post.call_count == 2
 
 
 @pytest.mark.asyncio
