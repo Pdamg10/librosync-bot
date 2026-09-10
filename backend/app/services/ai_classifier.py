@@ -73,12 +73,15 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "temperature": 0.1
+            "temperature": 0.1,
+            "thinkingConfig": {
+                "thinkingBudget": 512
+            }
         }
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(url, json=payload)
             if response.status_code == 200:
                 data = response.json()

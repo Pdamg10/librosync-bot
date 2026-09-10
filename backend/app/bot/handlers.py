@@ -16,9 +16,9 @@ from app.core.database import AsyncSessionLocal
 from app.models.user import User
 from app.models.link_code import LinkCode
 from app.models.telegram_link import TelegramLink
-from app.models.book import Book
 from app.models.topic import Topic
-from app.services.telegram_service import get_chat_and_bot_status, move_or_repost_to_topic
+from app.models.book import Book
+from app.services.telegram_service import get_chat_and_bot_status, move_or_repost_to_topic, ThreadNotFoundError
 from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug
 from app.services.ai_classifier import classify_book_with_gemini
 
@@ -252,15 +252,39 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Si el archivo se subió en el General o en un topic distinto, moverlo/copiarlo al topic del género
             if topic_id and current_thread_id != topic_id:
-                reposted_id = await move_or_repost_to_topic(
-                    bot=context.bot,
-                    chat_id=chat.id,
-                    message_id=message.message_id,
-                    topic_id=topic_id,
-                    delete_original=link.bot_is_admin
-                )
-                if reposted_id:
-                    target_message_id = reposted_id
+                try:
+                    reposted_id = await move_or_repost_to_topic(
+                        bot=context.bot,
+                        chat_id=chat.id,
+                        message_id=message.message_id,
+                        topic_id=topic_id,
+                        delete_original=link.bot_is_admin
+                    )
+                    if reposted_id:
+                        target_message_id = reposted_id
+                except ThreadNotFoundError:
+                    # El topic en Telegram fue borrado por un usuario. Auto-recuperación:
+                    logger.warning(f"Topic {topic_id} fue eliminado en Telegram. Auto-creando nuevo topic para '{genre}'...")
+                    from app.services.topic_resolver import delete_topic_by_thread_id
+                    await delete_topic_by_thread_id(session, link.id, topic_id)
+
+                    # Crear nuevo topic limpio en Telegram
+                    new_created = await context.bot.create_forum_topic(chat_id=chat.id, name=genre)
+                    new_topic = Topic(telegram_link_id=link.id, genre=genre, topic_id=new_created.message_thread_id)
+                    session.add(new_topic)
+                    await session.commit()
+                    await session.refresh(new_topic)
+
+                    assigned_topic_id = new_created.message_thread_id
+                    reposted_id = await move_or_repost_to_topic(
+                        bot=context.bot,
+                        chat_id=chat.id,
+                        message_id=message.message_id,
+                        topic_id=new_created.message_thread_id,
+                        delete_original=link.bot_is_admin
+                    )
+                    if reposted_id:
+                        target_message_id = reposted_id
 
         # 5. Registrar en base de datos
         new_book = Book(
@@ -280,3 +304,18 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.refresh(new_book)
 
         logger.info(f"Libro registrado: '{new_book.title}' por '{new_book.author}' -> Género: {new_book.genre}")
+
+        # 6. Notificación visual en el tema de destino para feedback inmediato
+        if assigned_topic_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=assigned_topic_id,
+                    text=f"📚 **Libro sincronizado y archivado**\n\n"
+                         f"📖 **Título:** {title}\n"
+                         f"✍️ **Autor:** {author}\n"
+                         f"🏷️ **Género:** {genre}",
+                    parse_mode="Markdown"
+                )
+            except Exception as notify_err:
+                logger.debug(f"No se pudo enviar mensaje de confirmación: {notify_err}")

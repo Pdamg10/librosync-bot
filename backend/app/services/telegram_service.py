@@ -1,18 +1,17 @@
 import logging
-from typing import Optional, Dict, Any, BinaryIO
+from typing import Optional, Dict, Any
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
 
 logger = logging.getLogger(__name__)
 
+class ThreadNotFoundError(Exception):
+    """Excepción cuando el topic/thread_id no existe o fue eliminado en Telegram."""
+    pass
+
 async def get_chat_and_bot_status(bot: Bot, chat_id: int) -> Dict[str, Any]:
     """
-    Inspecciona el chat y determina:
-    - chat_title
-    - chat_type (group, supergroup, channel, private)
-    - forum_enabled (si tiene Topics habilitados)
-    - bot_is_admin (si el bot es administrador)
-    - can_manage_topics (si tiene permiso explícito para crear/gestionar topics)
+    Inspecciona el chat y determina permisos y configuración Forum.
     """
     try:
         chat = await bot.get_chat(chat_id)
@@ -52,9 +51,6 @@ async def send_book_document(
     caption: Optional[str] = None,
     topic_id: Optional[int] = None
 ) -> Any:
-    """
-    Envía un documento al chat especificado, enrutando al topic_id si está presente.
-    """
     kwargs: Dict[str, Any] = {
         "chat_id": chat_id,
         "document": document,
@@ -65,7 +61,12 @@ async def send_book_document(
     if topic_id:
         kwargs["message_thread_id"] = topic_id
 
-    return await bot.send_document(**kwargs)
+    try:
+        return await bot.send_document(**kwargs)
+    except BadRequest as e:
+        if "message thread not found" in str(e).lower():
+            raise ThreadNotFoundError(f"Thread {topic_id} no existe en Telegram.")
+        raise
 
 async def move_or_repost_to_topic(
     bot: Bot,
@@ -75,8 +76,8 @@ async def move_or_repost_to_topic(
     delete_original: bool = True
 ) -> Optional[int]:
     """
-    Copia un mensaje al Topic correspondiente usando copy_message y borra el original si se solicita.
-    Retorna el message_id del nuevo mensaje en el Topic.
+    Copia un mensaje al Topic correspondiente y borra el original.
+    Lanza ThreadNotFoundError si el topic fue eliminado en Telegram.
     """
     try:
         new_msg = await bot.copy_message(
@@ -91,6 +92,13 @@ async def move_or_repost_to_topic(
             except TelegramError as del_err:
                 logger.warning(f"No se pudo borrar el mensaje original {message_id} en chat {chat_id}: {del_err}")
         return new_msg.message_id
+    except BadRequest as e:
+        err_msg = str(e).lower()
+        if "message thread not found" in err_msg or "thread_id_invalid" in err_msg:
+            logger.warning(f"Thread {topic_id} no existe en Telegram: {e}")
+            raise ThreadNotFoundError(f"El topic {topic_id} fue eliminado en Telegram.")
+        logger.error(f"Error BadRequest al copiar mensaje {message_id} al topic {topic_id}: {e}")
+        return None
     except TelegramError as e:
         logger.error(f"Error al reubicar mensaje {message_id} al topic {topic_id}: {e}")
         return None

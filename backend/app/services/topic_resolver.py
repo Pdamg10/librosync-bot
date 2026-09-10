@@ -18,6 +18,19 @@ def normalize_genre_slug(genre: str) -> str:
     nfkd = unicodedata.normalize('NFKD', genre).encode('ASCII', 'ignore').decode('utf-8')
     return re.sub(r'[^a-zA-Z0-9]', '', nfkd).lower()
 
+async def delete_topic_by_thread_id(session: AsyncSession, telegram_link_id: int, topic_id: int):
+    """Elimina un topic de la base de datos cuando Telegram reporta que fue eliminado."""
+    stmt = select(Topic).where(
+        Topic.telegram_link_id == telegram_link_id,
+        Topic.topic_id == topic_id
+    )
+    res = await session.execute(stmt)
+    topic = res.scalar_one_or_none()
+    if topic:
+        logger.info(f"Purgando topic zombie '{topic.genre}' (thread {topic_id}) de la base de datos.")
+        await session.delete(topic)
+        await session.commit()
+
 async def resolve_or_create_topic(
     session: AsyncSession,
     bot: Bot,
