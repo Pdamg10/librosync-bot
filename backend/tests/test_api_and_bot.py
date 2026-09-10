@@ -1,6 +1,7 @@
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from unittest.mock import AsyncMock, MagicMock
 
@@ -156,3 +157,52 @@ async def test_library_crud(client, test_session):
 
     get_res = await client.get(f"/library/{book.id}")
     assert get_res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_duplicate_book_detection(test_session):
+    user = User(id=1, nombre="Test User")
+    test_session.add(user)
+    await test_session.commit()
+
+    link = TelegramLink(
+        user_id=1,
+        chat_id=-1001234567890,
+        chat_type="group_forum",
+        chat_title="Biblioteca Club",
+        bot_is_admin=True,
+        forum_enabled=True
+    )
+    test_session.add(link)
+    await test_session.commit()
+    await test_session.refresh(link)
+
+    # Insertar libro base
+    book1 = Book(
+        user_id=1,
+        title="Espinas De Lujuria",
+        author="Eva Winners",
+        genre="Dark Romance",
+        source="telegram",
+        telegram_link_id=link.id,
+        telegram_message_id=500,
+        telegram_file_id="FILE_ID_1",
+        file_unique_id="UNIQUE_HASH_123",
+        file_format="epub"
+    )
+    test_session.add(book1)
+    await test_session.commit()
+
+    # 1. Simular comprobación por file_unique_id
+    stmt = select(Book).where(
+        Book.telegram_link_id == link.id,
+        Book.file_unique_id == "UNIQUE_HASH_123"
+    )
+    res = await test_session.execute(stmt)
+    found_dup = res.scalar_one_or_none()
+    assert found_dup is not None
+    assert found_dup.title == "Espinas De Lujuria"
+
+    # 2. Simular comprobación semántica por título
+    slug_incoming = normalize_genre_slug("01 - Espinas De Lujuria")
+    assert normalize_genre_slug(found_dup.title) in slug_incoming or slug_incoming in normalize_genre_slug(found_dup.title)

@@ -15,6 +15,7 @@ class BookCreate(BookBase):
     telegram_link_id: Optional[int] = None
     telegram_message_id: Optional[int] = None
     telegram_file_id: Optional[str] = None
+    file_unique_id: Optional[str] = None
 
 class BookUpdate(BaseModel):
     title: Optional[str] = None
@@ -29,6 +30,7 @@ class BookOut(BookBase):
     telegram_link_id: Optional[int] = None
     telegram_message_id: Optional[int] = None
     telegram_file_id: Optional[str] = None
+    file_unique_id: Optional[str] = None
     uploaded_at: datetime
     reading_progress: float
 

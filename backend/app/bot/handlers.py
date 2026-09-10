@@ -233,6 +233,38 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Documento recibido en chat no vinculado ({chat.id}). Ignorando.")
             return
 
+        # 1.1 Deduplicación Binaria Rápida (file_unique_id)
+        file_unique_id = getattr(doc, "file_unique_id", None)
+        if file_unique_id:
+            stmt_dup = select(Book).where(
+                Book.telegram_link_id == link.id,
+                Book.file_unique_id == file_unique_id
+            )
+            dup_res = await session.execute(stmt_dup)
+            existing_book = dup_res.scalar_one_or_none()
+            if existing_book and existing_book.telegram_message_id:
+                logger.info(f"Libro duplicado exacto detectado por file_unique_id: '{existing_book.title}'")
+                if link.bot_is_admin:
+                    try:
+                        await context.bot.delete_message(chat_id=chat.id, message_id=message.message_id)
+                    except Exception:
+                        pass
+
+                clean_chat_id = str(chat.id).replace("-100", "")
+                msg_link = f"https://t.me/c/{clean_chat_id}/{existing_book.telegram_message_id}"
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=getattr(message, "message_thread_id", None),
+                    text=f"ℹ️ **Este libro ya se encuentra en la biblioteca:**\n\n"
+                         f"📖 **{existing_book.title}**\n"
+                         f"✍️ *{existing_book.author}*\n"
+                         f"🏷️ Tema: **{existing_book.genre}** (`.{existing_book.file_format.upper()}`)\n\n"
+                         f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+                return
+
         # 2. Consultar lista de géneros ya existentes en este grupo
         stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
         topics_res = await session.execute(stmt_topics)
@@ -250,6 +282,47 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         author = classification["author"]
         genre = classification["genre"]
         suggested_emoji = classification.get("emoji", "📖")
+
+        # 3.1 Deduplicación Semántica (Título + Formato)
+        new_title_slug = normalize_genre_slug(title)
+        stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        books_res = await session.execute(stmt_books)
+        all_chat_books = books_res.scalars().all()
+
+        matching_book = None
+        for b in all_chat_books:
+            if normalize_genre_slug(b.title) == new_title_slug:
+                matching_book = b
+                break
+
+        if matching_book:
+            if matching_book.file_format.lower() == ext.lower():
+                # Duplicado del mismo formato
+                logger.info(f"Libro duplicado semántico detectado: '{matching_book.title}' ({ext})")
+                if link.bot_is_admin:
+                    try:
+                        await context.bot.delete_message(chat_id=chat.id, message_id=message.message_id)
+                    except Exception:
+                        pass
+
+                clean_chat_id = str(chat.id).replace("-100", "")
+                msg_link = f"https://t.me/c/{clean_chat_id}/{matching_book.telegram_message_id}"
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=getattr(message, "message_thread_id", None),
+                    text=f"ℹ️ **Este libro ya se encuentra en la biblioteca:**\n\n"
+                         f"📖 **{matching_book.title}**\n"
+                         f"✍️ *{matching_book.author}*\n"
+                         f"🏷️ Tema: **{matching_book.genre}** (`.{matching_book.file_format.upper()}`)\n\n"
+                         f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+                return
+            else:
+                # Formato complementario (ej: ya había EPUB y ahora suben PDF)
+                logger.info(f"Formato complementario para '{matching_book.title}': agrupando {ext} en el tema {matching_book.genre}")
+                genre = matching_book.genre
 
         current_thread_id = getattr(message, "message_thread_id", None)
         target_message_id = message.message_id
@@ -313,6 +386,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             telegram_link_id=link.id,
             telegram_message_id=target_message_id,
             telegram_file_id=doc.file_id,
+            file_unique_id=file_unique_id,
             file_format=ext,
             reading_progress=0.0
         )

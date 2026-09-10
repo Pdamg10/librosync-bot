@@ -19,6 +19,7 @@ class Book(Base):
     telegram_link_id = Column(Integer, ForeignKey("telegram_links.id", ondelete="SET NULL"), nullable=True)
     telegram_message_id = Column(Integer, nullable=True)
     telegram_file_id = Column(String(255), nullable=True)
+    file_unique_id = Column(String(100), index=True, nullable=True)
     file_format = Column(String(20), default="pdf")  # 'pdf' | 'epub' | 'mobi'
     uploaded_at = Column(DateTime, default=utc_now)
     reading_progress = Column(Float, default=0.0)
