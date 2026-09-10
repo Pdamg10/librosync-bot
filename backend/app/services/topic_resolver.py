@@ -35,14 +35,15 @@ async def resolve_or_create_topic(
     session: AsyncSession,
     bot: Bot,
     telegram_link: TelegramLink,
-    genre: Optional[str] = "General"
+    genre: Optional[str] = "General",
+    suggested_emoji: Optional[str] = None
 ) -> Optional[int]:
     """
     Resuelve el topic_id para un género dado:
     1. Si no es un supergrupo con Forum activado, retorna None.
     2. Búsqueda exacta en BD por género.
-    3. Búsqueda difusa/normalizada en BD (ej: 'darkromance' coincide con 'Dark Romance').
-    4. Si no existe coincidencia, crea el topic en Telegram con un nombre limpio y lo guarda en BD.
+    3. Búsqueda difusa/normalizada en BD (ej: 'darkromance' coincide con 'Dark Romance' o '🖤 Dark Romance').
+    4. Si no existe coincidencia, crea el topic en Telegram con un emoji representativo y lo guarda en BD.
     """
     clean_genre = (genre or "General").strip().title()
 
@@ -62,7 +63,7 @@ async def resolve_or_create_topic(
         logger.info(f"Topic exacto en BD: '{clean_genre}' -> id {existing_topic.topic_id}")
         return existing_topic.topic_id
 
-    # 2. Búsqueda normalizada / slug (para evitar duplicados por espacios o tildes)
+    # 2. Búsqueda normalizada / slug (para evitar duplicados por emojis, espacios o tildes)
     target_slug = normalize_genre_slug(clean_genre)
     all_topics_stmt = select(Topic).where(Topic.telegram_link_id == telegram_link.id)
     all_res = await session.execute(all_topics_stmt)
@@ -73,16 +74,20 @@ async def resolve_or_create_topic(
             logger.info(f"Topic coincidente por normalización: '{clean_genre}' == '{t.genre}' -> id {t.topic_id}")
             return t.topic_id
 
-    # 3. No existe -> Crear nuevo Topic en Telegram
+    # 3. No existe -> Crear nuevo Topic en Telegram con Emoji representativo
+    from app.services.ai_classifier import get_genre_emoji
+    emoji = get_genre_emoji(clean_genre, suggested_emoji)
+    topic_display_name = f"{emoji} {clean_genre}"[:128]
+
     try:
-        logger.info(f"Creando nuevo Forum Topic en Telegram: Chat {telegram_link.chat_id}, Género '{clean_genre}'")
+        logger.info(f"Creando nuevo Forum Topic en Telegram: Chat {telegram_link.chat_id}, Nombre '{topic_display_name}'")
         created_topic = await bot.create_forum_topic(
             chat_id=telegram_link.chat_id,
-            name=clean_genre
+            name=topic_display_name
         )
         topic_id = created_topic.message_thread_id
 
-        # Guardar en BD
+        # Guardar en BD con el género limpio
         new_topic = Topic(
             telegram_link_id=telegram_link.id,
             genre=clean_genre,
@@ -92,7 +97,7 @@ async def resolve_or_create_topic(
         await session.commit()
         await session.refresh(new_topic)
 
-        logger.info(f"Topic creado exitosamente: '{clean_genre}' -> thread {topic_id}")
+        logger.info(f"Topic creado exitosamente: '{topic_display_name}' -> thread {topic_id}")
         return topic_id
 
     except TelegramError as e:

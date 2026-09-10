@@ -8,6 +8,61 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+GENRE_EMOJIS: Dict[str, str] = {
+    "darkromance": "🖤",
+    "romance": "💖",
+    "fantasia": "🧙",
+    "cienciaficcion": "🚀",
+    "scifi": "🚀",
+    "thriller": "🔪",
+    "suspensopsicologico": "🔪",
+    "thrillerysuspensopsicologico": "🔪",
+    "terror": "👻",
+    "horror": "💀",
+    "misterio": "🕵️",
+    "novelanegra": "🔍",
+    "policial": "🚓",
+    "autoayuda": "🌱",
+    "desarrollopersonal": "🌱",
+    "autoayudaydesarrollopersonal": "🌱",
+    "manga": "🏯",
+    "manhwa": "🏯",
+    "manhua": "🏯",
+    "mangamanhwamanhua": "🏯",
+    "dystopia": "🌪️",
+    "distopia": "🌪️",
+    "historia": "📜",
+    "novelahistorica": "🏛️",
+    "poesia": "🪶",
+    "filosofia": "🏛️",
+    "aventura": "🗺️",
+    "general": "📚",
+    "erotica": "🔥",
+    "novela": "📖",
+    "comedia": "🎭",
+    "drama": "🎭",
+    "juvenil": "🎒",
+    "youngadult": "🎒",
+    "biografia": "👤",
+}
+
+def get_genre_emoji(genre: str, suggested_emoji: Optional[str] = None) -> str:
+    """Devuelve un emoji apropiado para el género."""
+    if suggested_emoji and 1 <= len(suggested_emoji.strip()) <= 4:
+        return suggested_emoji.strip()
+    
+    # Normalizar slug básico
+    import unicodedata
+    nfkd = unicodedata.normalize('NFKD', genre).encode('ASCII', 'ignore').decode('utf-8')
+    slug = re.sub(r'[^a-zA-Z0-9]', '', nfkd).lower()
+
+    if slug in GENRE_EMOJIS:
+        return GENRE_EMOJIS[slug]
+    for key, emo in GENRE_EMOJIS.items():
+        if key in slug or slug in key:
+            return emo
+    return "📖"
+
 def fallback_parse_filename(filename: str) -> Dict[str, str]:
     """Extracción heurística básica cuando la IA no está disponible."""
     name_no_ext = filename.rsplit(".", 1)[0]
@@ -16,15 +71,19 @@ def fallback_parse_filename(filename: str) -> Dict[str, str]:
 
     parts = re.split(r"\s*[-–—]\s*", clean_name)
     if len(parts) >= 2:
+        genre = "General"
         return {
             "title": parts[0].strip().replace("_", " ").title(),
             "author": parts[1].strip().replace("_", " ").title(),
-            "genre": "General"
+            "genre": genre,
+            "emoji": get_genre_emoji(genre)
         }
+    genre = "General"
     return {
         "title": clean_name.replace("_", " ").title(),
         "author": "Desconocido",
-        "genre": "General"
+        "genre": genre,
+        "emoji": get_genre_emoji(genre)
     }
 
 async def classify_book_with_gemini(
@@ -59,12 +118,14 @@ INSTRUCCIONES DE CLASIFICACIÓN:
    - PRIORIDAD MÁXIMA: Si el libro encaja o es afín a alguno de los "Temas YA CREADOS" en la lista, DEBES elegir EXACTAMENTE ese mismo nombre (respetando mayúsculas y espacios).
    - Si no encaja en ninguno de los existentes, propón un nombre de género canónico, elegante y corto (ej: "Dark Romance", "Ciencia Ficción", "Fantasía", "Thriller", "Autoayuda", "Terror").
    - NUNCA uses nombres genéricos vagos si puedes ser preciso (ej: prefiere "Dark Romance" o "Romance Histórico" si aplica).
+4. Elige un Emoji representativo del género (ej: 🖤 para Dark Romance, 🚀 para Ciencia Ficción, 🧙 para Fantasía, 🔪 para Thriller, 💖 para Romance, 📚 para General).
 
 Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
 {{
   "title": "Título limpio",
   "author": "Nombre del autor",
-  "genre": "Género o Tema asignado"
+  "genre": "Género o Tema asignado",
+  "emoji": "Emoji único representativo"
 }}
 """
 
@@ -87,11 +148,14 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
                 data = response.json()
                 candidate_text = data["candidates"][0]["content"]["parts"][0]["text"]
                 parsed = json.loads(candidate_text)
+                genre = parsed.get("genre", "General")
+                emoji = get_genre_emoji(genre, parsed.get("emoji"))
                 logger.info(f"Gemini clasificó exitosamente: {parsed}")
                 return {
                     "title": parsed.get("title", filename),
                     "author": parsed.get("author", "Desconocido"),
-                    "genre": parsed.get("genre", "General")
+                    "genre": genre,
+                    "emoji": emoji
                 }
             else:
                 logger.warning(f"Error en Gemini API ({response.status_code}): {response.text}")

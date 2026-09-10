@@ -173,26 +173,35 @@ async def set_topic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Este grupo no está vinculado a LibroSync. Vinclalo primero con `/start <codigo>`.")
             return
 
-        # Buscar si ya existía registro para este thread_id o género
-        stmt_topic = select(Topic).where(
-            Topic.telegram_link_id == link.id,
-            Topic.topic_id == thread_id
+        target_slug = normalize_genre_slug(genre_name)
+
+        # Buscar todos los topics del chat para limpiar cualquier conflicto de unicidad
+        stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
+        t_res = await session.execute(stmt_topics)
+        all_topics = t_res.scalars().all()
+
+        # Eliminar registros viejos que colisionen por thread_id o por género
+        for t in all_topics:
+            if t.topic_id == thread_id or normalize_genre_slug(t.genre) == target_slug:
+                await session.delete(t)
+
+        await session.flush()
+
+        # Insertar el nuevo mapeo limpio y libre de conflictos
+        new_t = Topic(
+            telegram_link_id=link.id,
+            genre=genre_name,
+            topic_id=thread_id
         )
-        t_res = await session.execute(stmt_topic)
-        existing_t = t_res.scalar_one_or_none()
-
-        if existing_t:
-            existing_t.genre = genre_name
-        else:
-            new_t = Topic(
-                telegram_link_id=link.id,
-                genre=genre_name,
-                topic_id=thread_id
-            )
-            session.add(new_t)
-
+        session.add(new_t)
         await session.commit()
-        await message.reply_text(f"✅ Tema asignado: a partir de ahora los libros de **{genre_name}** se archivarán aquí automáticamente.", parse_mode="Markdown")
+        await session.refresh(new_t)
+
+        await message.reply_text(
+            f"✅ **¡Tema vinculado exitosamente!**\n\n"
+            f"A partir de ahora los libros de **{genre_name}** se archivarán automáticamente en este tema.",
+            parse_mode="Markdown"
+        )
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,6 +249,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = classification["title"]
         author = classification["author"]
         genre = classification["genre"]
+        suggested_emoji = classification.get("emoji", "📖")
 
         current_thread_id = getattr(message, "message_thread_id", None)
         target_message_id = message.message_id
@@ -247,7 +257,13 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 4. Auto-organización en supergrupos con temas
         if link.forum_enabled:
-            topic_id = await resolve_or_create_topic(session, context.bot, link, genre)
+            topic_id = await resolve_or_create_topic(
+                session=session,
+                bot=context.bot,
+                telegram_link=link,
+                genre=genre,
+                suggested_emoji=suggested_emoji
+            )
             assigned_topic_id = topic_id
 
             # Si el archivo se subió en el General o en un topic distinto, moverlo/copiarlo al topic del género
@@ -263,13 +279,14 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if reposted_id:
                         target_message_id = reposted_id
                 except ThreadNotFoundError:
-                    # El topic en Telegram fue borrado por un usuario. Auto-recuperación:
+                    # El topic en Telegram fue borrado por un usuario. Auto-recuperación con Emoji:
                     logger.warning(f"Topic {topic_id} fue eliminado en Telegram. Auto-creando nuevo topic para '{genre}'...")
                     from app.services.topic_resolver import delete_topic_by_thread_id
+                    from app.services.ai_classifier import get_genre_emoji
                     await delete_topic_by_thread_id(session, link.id, topic_id)
 
-                    # Crear nuevo topic limpio en Telegram
-                    new_created = await context.bot.create_forum_topic(chat_id=chat.id, name=genre)
+                    emoji = get_genre_emoji(genre, suggested_emoji)
+                    new_created = await context.bot.create_forum_topic(chat_id=chat.id, name=f"{emoji} {genre}"[:128])
                     new_topic = Topic(telegram_link_id=link.id, genre=genre, topic_id=new_created.message_thread_id)
                     session.add(new_topic)
                     await session.commit()
