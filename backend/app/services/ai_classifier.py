@@ -1,6 +1,7 @@
 import logging
 import json
 import re
+import asyncio
 from typing import Optional, List, Dict, Any
 import httpx
 
@@ -63,25 +64,75 @@ def get_genre_emoji(genre: str, suggested_emoji: Optional[str] = None) -> str:
             return emo
     return "📖"
 
-def fallback_parse_filename(filename: str) -> Dict[str, str]:
-    """Extracción heurística básica cuando la IA no está disponible."""
+def fallback_parse_filename(
+    filename: str,
+    existing_topics: Optional[List[str]] = None,
+    current_topic_hint: Optional[str] = None
+) -> Dict[str, str]:
+    """Extracción heurística avanzada cuando la IA no está disponible o por rate-limit."""
     name_no_ext = filename.rsplit(".", 1)[0]
     # Limpiar prefijos numéricos típicos (ej: "01 - ", "[01] ")
     clean_name = re.sub(r"^(\d+[\s\-_.]+|\[\d+\]\s*|\(\d+\)\s*)", "", name_no_ext).strip()
 
     parts = re.split(r"\s*[-–—]\s*", clean_name)
+    title = clean_name.replace("_", " ").title()
+    author = "Desconocido"
     if len(parts) >= 2:
-        genre = "General"
+        title = parts[0].strip().replace("_", " ").title()
+        author = parts[1].strip().replace("_", " ").title()
+
+    # Si se conoce el tema actual donde ya estaba el mensaje, mantenerlo
+    if current_topic_hint:
+        genre = current_topic_hint
         return {
-            "title": parts[0].strip().replace("_", " ").title(),
-            "author": parts[1].strip().replace("_", " ").title(),
+            "title": title,
+            "author": author,
             "genre": genre,
             "emoji": get_genre_emoji(genre)
         }
+
+    # Helper local para comparar texto normalizado
+    import unicodedata
+    def _slug(s: str) -> str:
+        nfkd = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8')
+        return re.sub(r'[^a-zA-Z0-9]', '', nfkd).lower()
+
+    file_slug = _slug(filename)
     genre = "General"
+
+    if existing_topics:
+        # 1. Comprobar si el nombre de algún topic existente coincide con el archivo
+        for ex_t in existing_topics:
+            ex_slug = _slug(ex_t)
+            if ex_slug and (ex_slug in file_slug or file_slug in ex_slug):
+                genre = ex_t
+                break
+
+        # 2. Si sigue en General, comprobar palabras clave temáticas comunes
+        if genre == "General":
+            genre_keywords = {
+                "dark romance": ["dark", "lujuria", "mafia", "adeline", "pecado", "sombras", "enemiesto"],
+                "romance": ["amor", "love", "romance", "corazon", "pasion", "beso", "boda"],
+                "fantasia": ["fantasy", "fantasia", "magia", "dragon", "reino", "hada", "viento", "corte"],
+                "ciencia ficcion": ["scifi", "ciencia", "ficcion", "espacio", "galaxy", "futuro", "robot"],
+                "thriller": ["misterio", "asesin", "crimen", "detective", "sangre", "muerte", "suspens"],
+                "manga": ["manga", "manhwa", "manhua", "capitulo", "volumen"],
+                "dystopia": ["distopia", "dystopia", "apocalip", "caos", "juegos del hambre"],
+                "autoayuda": ["habitos", "autoayuda", "mente", "superacion", "exito", "finanzas"]
+            }
+            for kw_genre, kws in genre_keywords.items():
+                if any(kw in file_slug for kw in kws):
+                    target_kw_slug = _slug(kw_genre)
+                    for ex_t in existing_topics:
+                        if target_kw_slug in _slug(ex_t) or _slug(ex_t) in target_kw_slug:
+                            genre = ex_t
+                            break
+                    if genre != "General":
+                        break
+
     return {
-        "title": clean_name.replace("_", " ").title(),
-        "author": "Desconocido",
+        "title": title,
+        "author": author,
         "genre": genre,
         "emoji": get_genre_emoji(genre)
     }
@@ -89,24 +140,27 @@ def fallback_parse_filename(filename: str) -> Dict[str, str]:
 async def classify_book_with_gemini(
     filename: str,
     caption: Optional[str] = None,
-    existing_topics: Optional[List[str]] = None
+    existing_topics: Optional[List[str]] = None,
+    current_topic_hint: Optional[str] = None
 ) -> Dict[str, str]:
     """
     Clasifica un libro y extrae metadata limpia (título, autor, género) usando Google Gemini.
     Tiene en cuenta los temas ya existentes en el grupo para no duplicar.
+    Maneja reintentos con backoff para evitar saturación de cuota HTTP 429.
     """
     if not settings.GEMINI_API_KEY:
         logger.info("GEMINI_API_KEY no configurada. Usando parser heurístico.")
-        return fallback_parse_filename(filename)
+        return fallback_parse_filename(filename, existing_topics=existing_topics, current_topic_hint=current_topic_hint)
 
     topics_list = existing_topics or []
     topics_formatted = json.dumps(topics_list, ensure_ascii=False) if topics_list else "Ninguno aún"
+    hint_str = f"\n- Contexto actual: Este archivo se encuentra actualmente dentro del tema '{current_topic_hint}'." if current_topic_hint else ""
 
     prompt = f"""
 Eres el bibliotecario y clasificador experto de una biblioteca digital en Telegram.
 Analiza este libro que acaba de ser subido:
 - Nombre del archivo: "{filename}"
-- Texto/Comentario del usuario: "{caption or 'Ninguno'}"
+- Texto/Comentario del usuario: "{caption or 'Ninguno'}"{hint_str}
 
 Lista de Temas (Topics) YA CREADOS en el grupo de Telegram:
 {topics_formatted}
@@ -141,26 +195,38 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
         }
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(url, json=payload)
-            if response.status_code == 200:
-                data = response.json()
-                candidate_text = data["candidates"][0]["content"]["parts"][0]["text"]
-                parsed = json.loads(candidate_text)
-                genre = parsed.get("genre", "General")
-                emoji = get_genre_emoji(genre, parsed.get("emoji"))
-                logger.info(f"Gemini clasificó exitosamente: {parsed}")
-                return {
-                    "title": parsed.get("title", filename),
-                    "author": parsed.get("author", "Desconocido"),
-                    "genre": genre,
-                    "emoji": emoji
-                }
-            else:
-                logger.warning(f"Error en Gemini API ({response.status_code}): {response.text}")
-    except Exception as e:
-        logger.error(f"Excepción al consultar Gemini API: {e}")
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(url, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
+                    candidate_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = json.loads(candidate_text)
+                    genre = parsed.get("genre", current_topic_hint or "General")
+                    emoji = get_genre_emoji(genre, parsed.get("emoji"))
+                    logger.info(f"Gemini clasificó exitosamente: {parsed}")
+                    return {
+                        "title": parsed.get("title", filename),
+                        "author": parsed.get("author", "Desconocido"),
+                        "genre": genre,
+                        "emoji": emoji
+                    }
+                elif response.status_code == 429 and attempt < max_retries - 1:
+                    logger.warning(f"Rate limit 429 en Gemini API. Esperando 2.5s antes de reintentar (intento {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(2.5)
+                    continue
+                else:
+                    logger.warning(f"Error en Gemini API ({response.status_code}): {response.text}")
+                    break
+        except Exception as e:
+            logger.error(f"Excepción al consultar Gemini API: {e}")
+            break
 
     # Fallback si la IA falla
-    return fallback_parse_filename(filename)
+    return fallback_parse_filename(
+        filename=filename,
+        existing_topics=existing_topics,
+        current_topic_hint=current_topic_hint
+    )

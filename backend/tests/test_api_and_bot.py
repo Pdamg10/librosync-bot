@@ -12,7 +12,7 @@ from app.models.telegram_link import TelegramLink
 from app.models.topic import Topic
 from app.models.book import Book
 from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug
-from app.services.ai_classifier import classify_book_with_gemini
+from app.services.ai_classifier import classify_book_with_gemini, fallback_parse_filename
 
 # Test database in-memory
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
@@ -206,3 +206,58 @@ async def test_duplicate_book_detection(test_session):
     # 2. Simular comprobación semántica por título
     slug_incoming = normalize_genre_slug("01 - Espinas De Lujuria")
     assert normalize_genre_slug(found_dup.title) in slug_incoming or slug_incoming in normalize_genre_slug(found_dup.title)
+
+
+def test_fallback_parse_filename():
+    # Caso 1: Con hint del tema actual
+    res1 = fallback_parse_filename("01 - Mi Secreto - Jane Doe.pdf", current_topic_hint="Dark Romance")
+    assert res1["genre"] == "Dark Romance"
+    assert res1["title"] == "Mi Secreto"
+    assert res1["author"] == "Jane Doe"
+    assert res1["emoji"] == "🖤"
+
+    # Caso 2: Coincidencia por palabra clave de tema existente
+    existing = ["Dark Romance", "Ciencia Ficción", "Fantasía"]
+    res2 = fallback_parse_filename("El Dragon Y La Magia - Autor.epub", existing_topics=existing)
+    assert res2["genre"] == "Fantasía"
+    assert res2["title"] == "El Dragon Y La Magia"
+    assert res2["author"] == "Autor"
+
+    # Caso 3: Coincidencia de slug directo
+    res3 = fallback_parse_filename("dark romance especial.pdf", existing_topics=existing)
+    assert res3["genre"] == "Dark Romance"
+
+
+@pytest.mark.asyncio
+async def test_gemini_retry_on_429():
+    import httpx
+    from unittest.mock import patch, AsyncMock
+
+    mock_resp_429 = MagicMock()
+    mock_resp_429.status_code = 429
+    mock_resp_429.text = "RESOURCE_EXHAUSTED"
+
+    mock_resp_200 = MagicMock()
+    mock_resp_200.status_code = 200
+    mock_resp_200.json.return_value = {
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "text": '{"title": "Cien Años de Soledad", "author": "Gabriel García Márquez", "genre": "Fantasía", "emoji": "🧙"}'
+                }]
+            }
+        }]
+    }
+
+    mock_client = AsyncMock()
+    # Primera llamada da 429, segunda da 200
+    mock_client.post.side_effect = [mock_resp_429, mock_resp_200]
+
+    with patch("httpx.AsyncClient") as mock_client_cls, \
+         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+        res = await classify_book_with_gemini("Cien Años de Soledad.epub")
+        assert res["title"] == "Cien Años de Soledad"
+        assert res["genre"] == "Fantasía"
+        assert mock_sleep.called
+

@@ -20,8 +20,8 @@ from app.models.telegram_link import TelegramLink
 from app.models.topic import Topic
 from app.models.book import Book
 from app.services.telegram_service import get_chat_and_bot_status, move_or_repost_to_topic, ThreadNotFoundError
-from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug
-from app.services.ai_classifier import classify_book_with_gemini
+from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug, delete_topic_by_thread_id
+from app.services.ai_classifier import classify_book_with_gemini, get_genre_emoji
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +266,19 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # 2. Consultar lista de géneros ya existentes en este grupo
+        # 2. Contexto de thread actual y lista de géneros existentes
+        current_thread_id = getattr(message, "message_thread_id", None)
+        current_topic_hint = None
+        if current_thread_id:
+            stmt_cur = select(Topic).where(
+                Topic.telegram_link_id == link.id,
+                Topic.topic_id == current_thread_id
+            )
+            cur_res = await session.execute(stmt_cur)
+            current_topic_obj = cur_res.scalar_one_or_none()
+            if current_topic_obj:
+                current_topic_hint = current_topic_obj.genre
+
         stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
         topics_res = await session.execute(stmt_topics)
         existing_topics_list = [t.genre for t in topics_res.scalars().all()]
@@ -276,7 +288,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         classification = await classify_book_with_gemini(
             filename=filename,
             caption=message.caption,
-            existing_topics=existing_topics_list
+            existing_topics=existing_topics_list,
+            current_topic_hint=current_topic_hint
         )
 
         title = classification["title"]
@@ -699,89 +712,189 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     status_msg = await message.reply_text("⏳ Procesando libro antiguo con Gemini AI...")
 
-    async with AsyncSessionLocal() as session:
-        stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
-        res = await session.execute(stmt)
-        link = res.scalar_one_or_none()
+    try:
+        async with AsyncSessionLocal() as session:
+            stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+            res = await session.execute(stmt)
+            link = res.scalar_one_or_none()
 
-        if not link:
-            await status_msg.edit_text("❌ Este grupo no está vinculado a LibroSync.")
-            return
+            if not link:
+                await status_msg.edit_text("❌ Este grupo no está vinculado a LibroSync.")
+                return
 
-        # Consultar temas existentes
-        stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
-        topics_res = await session.execute(stmt_topics)
-        existing_topics_list = [t.genre for t in topics_res.scalars().all()]
-
-        # Clasificar con Gemini
-        classification = await classify_book_with_gemini(
-            filename=filename,
-            caption=target_msg.caption,
-            existing_topics=existing_topics_list
-        )
-
-        title = classification["title"]
-        author = classification["author"]
-        genre = classification["genre"]
-        suggested_emoji = classification.get("emoji", "📖")
-
-        # Comprobar si ya está en el topic correcto
-        current_thread_id = getattr(target_msg, "message_thread_id", None)
-        target_message_id = target_msg.message_id
-        assigned_topic_id = current_thread_id
-
-        if link.forum_enabled:
-            topic_id = await resolve_or_create_topic(
-                session=session,
-                bot=context.bot,
-                telegram_link=link,
-                genre=genre,
-                suggested_emoji=suggested_emoji
-            )
-            assigned_topic_id = topic_id
-
-            # Si el libro viejo estaba en General y debe ir al topic
-            if topic_id and current_thread_id != topic_id:
-                reposted_id = await move_or_repost_to_topic(
-                    bot=context.bot,
-                    chat_id=chat.id,
-                    message_id=target_msg.message_id,
-                    topic_id=topic_id,
-                    delete_original=False  # No borrar el mensaje histórico original por seguridad
+            # 1. Deduplicación Rápida por file_unique_id
+            file_unique_id = getattr(doc, "file_unique_id", None)
+            if file_unique_id:
+                stmt_dup = select(Book).where(
+                    Book.telegram_link_id == link.id,
+                    Book.file_unique_id == file_unique_id
                 )
-                if reposted_id:
-                    target_message_id = reposted_id
+                dup_res = await session.execute(stmt_dup)
+                existing_book = dup_res.scalar_one_or_none()
+                if existing_book and existing_book.telegram_message_id:
+                    clean_chat_id = str(chat.id).replace("-100", "")
+                    msg_link = f"https://t.me/c/{clean_chat_id}/{existing_book.telegram_message_id}"
+                    await status_msg.edit_text(
+                        f"ℹ️ **Este libro ya se encuentra registrado en la biblioteca:**\n\n"
+                        f"📖 **{existing_book.title}**\n"
+                        f"✍️ *{existing_book.author}*\n"
+                        f"🏷️ Tema: **{existing_book.genre}** (`.{existing_book.file_format.upper()}`)\n\n"
+                        f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                    return
 
-        # Registrar en BD
-        new_book = Book(
-            user_id=link.user_id,
-            title=title,
-            author=author,
-            genre=genre,
-            source="telegram",
-            telegram_link_id=link.id,
-            telegram_message_id=target_message_id,
-            telegram_file_id=doc.file_id,
-            file_unique_id=getattr(doc, "file_unique_id", None),
-            file_format=ext,
-            reading_progress=0.0
-        )
-        session.add(new_book)
-        await session.commit()
-        await session.refresh(new_book)
+            # 2. Obtener contexto del thread actual (si el libro o el comando ya están dentro de un tema)
+            current_thread_id = getattr(target_msg, "message_thread_id", None) or getattr(message, "message_thread_id", None)
+            current_topic_hint = None
+            if current_thread_id:
+                stmt_cur = select(Topic).where(
+                    Topic.telegram_link_id == link.id,
+                    Topic.topic_id == current_thread_id
+                )
+                cur_res = await session.execute(stmt_cur)
+                current_topic_obj = cur_res.scalar_one_or_none()
+                if current_topic_obj:
+                    current_topic_hint = current_topic_obj.genre
 
-        clean_chat_id = str(chat.id).replace("-100", "")
-        link_url = f"https://t.me/c/{clean_chat_id}/{target_message_id}"
+            # 3. Consultar temas existentes en este grupo
+            stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
+            topics_res = await session.execute(stmt_topics)
+            existing_topics_list = [t.genre for t in topics_res.scalars().all()]
 
-        await status_msg.edit_text(
-            f"✅ **¡Libro antiguo registrado con éxito!**\n\n"
-            f"📖 **Título:** {title}\n"
-            f"✍️ **Autor:** {author}\n"
-            f"🏷️ **Tema:** {suggested_emoji} **{genre}**\n\n"
-            f"👉 [Ir al libro]({link_url})",
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
+            # 4. Clasificar con Gemini (con reintentos y contexto de thread)
+            classification = await classify_book_with_gemini(
+                filename=filename,
+                caption=target_msg.caption,
+                existing_topics=existing_topics_list,
+                current_topic_hint=current_topic_hint
+            )
+
+            title = classification["title"]
+            author = classification["author"]
+            genre = classification["genre"]
+            suggested_emoji = classification.get("emoji", "📖")
+
+            # 4.1 Deduplicación Semántica (Título + Formato)
+            new_title_slug = normalize_genre_slug(title)
+            stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+            books_res = await session.execute(stmt_books)
+            all_chat_books = books_res.scalars().all()
+
+            matching_book = None
+            for b in all_chat_books:
+                if normalize_genre_slug(b.title) == new_title_slug:
+                    matching_book = b
+                    break
+
+            if matching_book:
+                if matching_book.file_format.lower() == ext.lower():
+                    clean_chat_id = str(chat.id).replace("-100", "")
+                    msg_link = f"https://t.me/c/{clean_chat_id}/{matching_book.telegram_message_id}"
+                    await status_msg.edit_text(
+                        f"ℹ️ **Este libro ya se encuentra registrado en la biblioteca:**\n\n"
+                        f"📖 **{matching_book.title}**\n"
+                        f"✍️ *{matching_book.author}*\n"
+                        f"🏷️ Tema: **{matching_book.genre}** (`.{matching_book.file_format.upper()}`)\n\n"
+                        f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                    return
+                else:
+                    # Formato complementario (ej: ya había EPUB y ahora registran PDF)
+                    genre = matching_book.genre
+
+            # 5. Comprobar si ya está en el topic correcto o si debe moverse/copiarse
+            target_message_id = target_msg.message_id
+            assigned_topic_id = current_thread_id
+
+            if link.forum_enabled:
+                topic_id = await resolve_or_create_topic(
+                    session=session,
+                    bot=context.bot,
+                    telegram_link=link,
+                    genre=genre,
+                    suggested_emoji=suggested_emoji
+                )
+                assigned_topic_id = topic_id
+
+                # Si el libro viejo no estaba en el topic asignado, copiarlo allí
+                if topic_id and current_thread_id != topic_id:
+                    try:
+                        reposted_id = await move_or_repost_to_topic(
+                            bot=context.bot,
+                            chat_id=chat.id,
+                            message_id=target_msg.message_id,
+                            topic_id=topic_id,
+                            delete_original=False  # No borrar el mensaje histórico original por seguridad
+                        )
+                        if reposted_id:
+                            target_message_id = reposted_id
+                    except ThreadNotFoundError:
+                        # Auto-recuperación si el topic en Telegram fue eliminado
+                        logger.warning(f"Topic {topic_id} fue eliminado en Telegram. Auto-creando nuevo topic para '{genre}'...")
+                        await delete_topic_by_thread_id(session, link.id, topic_id)
+
+                        emoji = get_genre_emoji(genre, suggested_emoji)
+                        new_created = await context.bot.create_forum_topic(chat_id=chat.id, name=f"{emoji} {genre}"[:128])
+                        new_topic = Topic(telegram_link_id=link.id, genre=genre, topic_id=new_created.message_thread_id)
+                        session.add(new_topic)
+                        await session.commit()
+                        await session.refresh(new_topic)
+
+                        assigned_topic_id = new_created.message_thread_id
+                        reposted_id = await move_or_repost_to_topic(
+                            bot=context.bot,
+                            chat_id=chat.id,
+                            message_id=target_msg.message_id,
+                            topic_id=new_created.message_thread_id,
+                            delete_original=False
+                        )
+                        if reposted_id:
+                            target_message_id = reposted_id
+
+            # 6. Registrar en Base de Datos
+            new_book = Book(
+                user_id=link.user_id,
+                title=title,
+                author=author,
+                genre=genre,
+                source="telegram",
+                telegram_link_id=link.id,
+                telegram_message_id=target_message_id,
+                telegram_file_id=doc.file_id,
+                file_unique_id=getattr(doc, "file_unique_id", None),
+                file_format=ext,
+                reading_progress=0.0
+            )
+            session.add(new_book)
+            await session.commit()
+            await session.refresh(new_book)
+
+            clean_chat_id = str(chat.id).replace("-100", "")
+            link_url = f"https://t.me/c/{clean_chat_id}/{target_message_id}"
+
+            await status_msg.edit_text(
+                f"✅ **¡Libro antiguo registrado con éxito!**\n\n"
+                f"📖 **Título:** {title}\n"
+                f"✍️ **Autor:** {author}\n"
+                f"🏷️ **Tema:** {suggested_emoji} **{genre}** (`.{ext.upper()}`)\n\n"
+                f"👉 [Ir al libro]({link_url})",
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.error(f"Error registrando libro antiguo en chat {chat.id}: {e}", exc_info=True)
+        try:
+            await status_msg.edit_text(
+                f"❌ **No se pudo registrar el libro:**\n`{str(e)[:250]}`\n\n"
+                "Por favor, intenta de nuevo.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
