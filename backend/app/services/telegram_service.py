@@ -68,6 +68,9 @@ async def send_book_document(
             raise ThreadNotFoundError(f"Thread {topic_id} no existe en Telegram.")
         raise
 
+import asyncio
+from telegram.error import TelegramError, BadRequest, RetryAfter
+
 async def move_or_repost_to_topic(
     bot: Bot,
     chat_id: int,
@@ -78,27 +81,43 @@ async def move_or_repost_to_topic(
     """
     Copia un mensaje al Topic correspondiente y borra el original.
     Lanza ThreadNotFoundError si el topic fue eliminado en Telegram.
+    Maneja automáticamente RetryAfter si Telegram frena por rate limits en envíos masivos.
     """
-    try:
-        new_msg = await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=chat_id,
-            message_id=message_id,
-            message_thread_id=topic_id
-        )
-        if delete_original:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=message_id)
-            except TelegramError as del_err:
-                logger.warning(f"No se pudo borrar el mensaje original {message_id} en chat {chat_id}: {del_err}")
-        return new_msg.message_id
-    except BadRequest as e:
-        err_msg = str(e).lower()
-        if "message thread not found" in err_msg or "thread_id_invalid" in err_msg:
-            logger.warning(f"Thread {topic_id} no existe en Telegram: {e}")
-            raise ThreadNotFoundError(f"El topic {topic_id} fue eliminado en Telegram.")
-        logger.error(f"Error BadRequest al copiar mensaje {message_id} al topic {topic_id}: {e}")
-        return None
-    except TelegramError as e:
-        logger.error(f"Error al reubicar mensaje {message_id} al topic {topic_id}: {e}")
-        return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            new_msg = await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_id=message_id,
+                message_thread_id=topic_id
+            )
+            if delete_original:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                except RetryAfter as del_rate_err:
+                    await asyncio.sleep(del_rate_err.retry_after + 0.5)
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    except Exception:
+                        pass
+                except TelegramError as del_err:
+                    logger.warning(f"No se pudo borrar el mensaje original {message_id} en chat {chat_id}: {del_err}")
+            return new_msg.message_id
+
+        except RetryAfter as rate_err:
+            wait_time = rate_err.retry_after + 1.0
+            logger.warning(f"Rate limit de Telegram alcanzado al mover mensaje. Esperando {wait_time}s (intento {attempt+1}/{max_retries})...")
+            await asyncio.sleep(wait_time)
+            continue
+        except BadRequest as e:
+            err_msg = str(e).lower()
+            if "message thread not found" in err_msg or "thread_id_invalid" in err_msg:
+                logger.warning(f"Thread {topic_id} no existe en Telegram: {e}")
+                raise ThreadNotFoundError(f"El topic {topic_id} fue eliminado en Telegram.")
+            logger.error(f"Error BadRequest al copiar mensaje {message_id} al topic {topic_id}: {e}")
+            return None
+        except TelegramError as e:
+            logger.error(f"Error al reubicar mensaje {message_id} al topic {topic_id}: {e}")
+            return None
+    return None
