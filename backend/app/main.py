@@ -22,10 +22,12 @@ async def lifespan(app: FastAPI):
     logger.info("Base de datos lista.")
 
     # 2. Inicializar y Arrancar Bot de Telegram (Polling en background)
+    from app.bot.bot_instance import get_bot_application, setup_bot_commands
     bot_app = get_bot_application()
     logger.info("Iniciando bot de Telegram (Polling)...")
     await bot_app.initialize()
     await bot_app.start()
+    await setup_bot_commands(bot_app.bot)
     await bot_app.updater.start_polling(drop_pending_updates=True)
     logger.info("Bot de Telegram en línea y escuchando actualizaciones.")
 

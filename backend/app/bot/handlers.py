@@ -3,11 +3,12 @@ import re
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ContextTypes,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 from sqlalchemy import select
@@ -410,3 +411,396 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as notify_err:
                 logger.debug(f"No se pudo enviar mensaje de confirmación: {notify_err}")
+
+
+def build_catalog_page(chat_id: int, books: List[Book], page: int = 1, per_page: int = 5) -> tuple[str, InlineKeyboardMarkup]:
+    """Genera el texto y la botonera de paginación del catálogo de libros."""
+    from app.services.ai_classifier import get_genre_emoji
+
+    total_books = len(books)
+    total_pages = max(1, (total_books + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    page_books = books[start_idx:end_idx]
+
+    clean_chat_id = str(chat_id).replace("-100", "")
+
+    lines = [
+        "📚 **Catálogo de Libros Disponibles**",
+        f"*(Página {page} de {total_pages} — {total_books} libros registrados)*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ]
+
+    for i, b in enumerate(page_books, start=start_idx + 1):
+        emo = get_genre_emoji(b.genre)
+        date_str = b.uploaded_at.strftime("%d/%m/%Y") if b.uploaded_at else "Reciente"
+        fmt = (b.file_format or "pdf").upper()
+        
+        msg_link = f"https://t.me/c/{clean_chat_id}/{b.telegram_message_id}" if b.telegram_message_id else None
+        link_md = f"[👉 Ver libro]({msg_link})" if msg_link else "*(Sin enlace)*"
+
+        lines.append(
+            f"**{i}. 📖 {b.title}**\n"
+            f"   ✍️ Autor: *{b.author}*\n"
+            f"   🏷️ Tema: {emo} **{b.genre}** (`.{fmt}`)\n"
+            f"   📅 Fecha: `{date_str}` | {link_md}\n"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # Botones de paginación
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"catalog:page:{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="catalog:noop"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"catalog:page:{page + 1}"))
+
+    keyboard = InlineKeyboardMarkup([nav_buttons]) if total_pages > 1 else InlineKeyboardMarkup([[]])
+    return "\n".join(lines), keyboard
+
+
+async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /libros o /catalogo:
+    Muestra la lista paginada de libros disponibles con título, autor, fecha, género y enlace directo.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+        res = await session.execute(stmt)
+        link = res.scalar_one_or_none()
+
+        if not link:
+            await message.reply_text("❌ Este grupo no está vinculado a LibroSync.", parse_mode="Markdown")
+            return
+
+        # Consultar libros ordenados por fecha descendente
+        stmt_books = select(Book).where(Book.telegram_link_id == link.id).order_by(Book.uploaded_at.desc())
+        b_res = await session.execute(stmt_books)
+        books = b_res.scalars().all()
+
+        if not books:
+            await message.reply_text(
+                "📚 **La biblioteca aún está vacía.**\n\n"
+                "Sube libros en formato PDF o EPUB al chat para empezar a armar el catálogo.",
+                parse_mode="Markdown"
+            )
+            return
+
+        text, keyboard = build_catalog_page(chat.id, books, page=1)
+        await message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+
+async def catalog_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los clics de paginación de /libros."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    data = query.data
+    if data == "catalog:noop":
+        return
+
+    if data.startswith("catalog:page:"):
+        page_num = int(data.split(":")[-1])
+        chat = update.effective_chat
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+            res = await session.execute(stmt)
+            link = res.scalar_one_or_none()
+            if not link:
+                return
+
+            stmt_books = select(Book).where(Book.telegram_link_id == link.id).order_by(Book.uploaded_at.desc())
+            b_res = await session.execute(stmt_books)
+            books = b_res.scalars().all()
+
+            text, keyboard = build_catalog_page(chat.id, books, page=page_num)
+            try:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+
+
+async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /temas:
+    Lista todos los temas activos y cuántos libros tiene cada uno.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    from app.services.ai_classifier import get_genre_emoji
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+        res = await session.execute(stmt)
+        link = res.scalar_one_or_none()
+
+        if not link:
+            await message.reply_text("❌ Este grupo no está vinculado a LibroSync.", parse_mode="Markdown")
+            return
+
+        stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id).order_by(Topic.genre.asc())
+        t_res = await session.execute(stmt_topics)
+        topics = t_res.scalars().all()
+
+        if not topics:
+            await message.reply_text("ℹ️ Aún no hay temas registrados en este grupo.", parse_mode="Markdown")
+            return
+
+        # Contar libros por tema
+        stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        b_res = await session.execute(stmt_books)
+        all_books = b_res.scalars().all()
+
+        counts = {}
+        for b in all_books:
+            counts[b.genre] = counts.get(b.genre, 0) + 1
+
+        clean_chat_id = str(chat.id).replace("-100", "")
+
+        lines = [
+            "🏷️ **Temas y Géneros Disponibles**",
+            f"*(Total: {len(topics)} temas en este grupo)*",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ]
+
+        for t in topics:
+            emo = get_genre_emoji(t.genre)
+            qty = counts.get(t.genre, 0)
+            topic_link = f"https://t.me/c/{clean_chat_id}/{t.topic_id}"
+            lines.append(f"• {emo} [**{t.genre}**]({topic_link}) — `{qty} libro(s)`")
+
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 *Pulsa sobre cualquier tema para entrar directamente a él.*")
+
+        await message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def topic_index_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /indice:
+    Debe ejecutarse DENTRO de un tema. Publica un mensaje índice formateado con todos
+    los libros disponibles en este tema específico, con enlaces directos para fijar.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    thread_id = getattr(message, "message_thread_id", None)
+    if not thread_id:
+        await message.reply_text("⚠️ Este comando debe ejecutarse **dentro** del tema que deseas indexar.", parse_mode="Markdown")
+        return
+
+    from app.services.ai_classifier import get_genre_emoji
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+        res = await session.execute(stmt)
+        link = res.scalar_one_or_none()
+
+        if not link:
+            await message.reply_text("❌ Este grupo no está vinculado a LibroSync.", parse_mode="Markdown")
+            return
+
+        # Buscar qué tema corresponde a este thread_id
+        stmt_topic = select(Topic).where(
+            Topic.telegram_link_id == link.id,
+            Topic.topic_id == thread_id
+        )
+        t_res = await session.execute(stmt_topic)
+        topic = t_res.scalar_one_or_none()
+
+        genre_name = topic.genre if topic else "General"
+        emo = get_genre_emoji(genre_name)
+
+        # Buscar libros de este tema
+        stmt_books = select(Book).where(
+            Book.telegram_link_id == link.id,
+            Book.genre == genre_name
+        ).order_by(Book.title.asc())
+        b_res = await session.execute(stmt_books)
+        books = b_res.scalars().all()
+
+        clean_chat_id = str(chat.id).replace("-100", "")
+
+        lines = [
+            f"📌 **ÍNDICE DE LA COLECCIÓN: {emo} {genre_name}**",
+            f"*(Total: {len(books)} libros disponibles)*",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ]
+
+        if not books:
+            lines.append("*(Aún no hay libros archivados en este tema)*\n")
+        else:
+            for i, b in enumerate(books, start=1):
+                fmt = (b.file_format or "pdf").upper()
+                msg_link = f"https://t.me/c/{clean_chat_id}/{b.telegram_message_id}" if b.telegram_message_id else None
+                link_md = f"[📥 Descargar]({msg_link})" if msg_link else ""
+                lines.append(f"**{i}.** 📖 **{b.title}** — *{b.author}* (`.{fmt}`) {link_md}")
+
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 *Tip para Administradores: Fija este mensaje en el tema para que los lectores lo vean al entrar.*")
+
+        await message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /registrar o /indexar:
+    Permite catalogar libros antiguos que ya estaban en el chat antes de que el bot se agregara.
+    El usuario responde a un mensaje antiguo que tenga un PDF/EPUB con `/registrar`.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    if not message.reply_to_message or not message.reply_to_message.document:
+        await message.reply_text(
+            "⚠️ **Modo de Uso:**\n"
+            "Responde a un mensaje antiguo que contenga un libro (PDF o EPUB) escribiendo `/registrar`.",
+            parse_mode="Markdown"
+        )
+        return
+
+    target_msg = message.reply_to_message
+    doc = target_msg.document
+    filename = doc.file_name or "libro_antiguo"
+    base_raw, ext = clean_filename(filename)
+
+    if f".{ext}" not in SUPPORTED_EXTENSIONS:
+        await message.reply_text(f"⚠️ Extensión `.{ext}` no soportada.", parse_mode="Markdown")
+        return
+
+    status_msg = await message.reply_text("⏳ Procesando libro antiguo con Gemini AI...")
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+        res = await session.execute(stmt)
+        link = res.scalar_one_or_none()
+
+        if not link:
+            await status_msg.edit_text("❌ Este grupo no está vinculado a LibroSync.")
+            return
+
+        # Consultar temas existentes
+        stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
+        topics_res = await session.execute(stmt_topics)
+        existing_topics_list = [t.genre for t in topics_res.scalars().all()]
+
+        # Clasificar con Gemini
+        classification = await classify_book_with_gemini(
+            filename=filename,
+            caption=target_msg.caption,
+            existing_topics=existing_topics_list
+        )
+
+        title = classification["title"]
+        author = classification["author"]
+        genre = classification["genre"]
+        suggested_emoji = classification.get("emoji", "📖")
+
+        # Comprobar si ya está en el topic correcto
+        current_thread_id = getattr(target_msg, "message_thread_id", None)
+        target_message_id = target_msg.message_id
+        assigned_topic_id = current_thread_id
+
+        if link.forum_enabled:
+            topic_id = await resolve_or_create_topic(
+                session=session,
+                bot=context.bot,
+                telegram_link=link,
+                genre=genre,
+                suggested_emoji=suggested_emoji
+            )
+            assigned_topic_id = topic_id
+
+            # Si el libro viejo estaba en General y debe ir al topic
+            if topic_id and current_thread_id != topic_id:
+                reposted_id = await move_or_repost_to_topic(
+                    bot=context.bot,
+                    chat_id=chat.id,
+                    message_id=target_msg.message_id,
+                    topic_id=topic_id,
+                    delete_original=False  # No borrar el mensaje histórico original por seguridad
+                )
+                if reposted_id:
+                    target_message_id = reposted_id
+
+        # Registrar en BD
+        new_book = Book(
+            user_id=link.user_id,
+            title=title,
+            author=author,
+            genre=genre,
+            source="telegram",
+            telegram_link_id=link.id,
+            telegram_message_id=target_message_id,
+            telegram_file_id=doc.file_id,
+            file_unique_id=getattr(doc, "file_unique_id", None),
+            file_format=ext,
+            reading_progress=0.0
+        )
+        session.add(new_book)
+        await session.commit()
+        await session.refresh(new_book)
+
+        clean_chat_id = str(chat.id).replace("-100", "")
+        link_url = f"https://t.me/c/{clean_chat_id}/{target_message_id}"
+
+        await status_msg.edit_text(
+            f"✅ **¡Libro antiguo registrado con éxito!**\n\n"
+            f"📖 **Título:** {title}\n"
+            f"✍️ **Autor:** {author}\n"
+            f"🏷️ **Tema:** {suggested_emoji} **{genre}**\n\n"
+            f"👉 [Ir al libro]({link_url})",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la guía completa de comandos disponibles."""
+    message = update.effective_message
+    if not message:
+        return
+
+    help_text = (
+        "🤖 **Comandos Disponibles en Griffin — LibroSync:**\n\n"
+        "📚 **Biblioteca & Catálogo:**\n"
+        "• `/libros` o `/catalogo` — Lista paginada de todos los libros con autor, fecha, tema y enlaces de descarga.\n"
+        "• `/temas` — Ver todos los géneros registrados en el grupo con conteo de libros.\n"
+        "• `/indice` — *(Ejecutar dentro de un tema)* Genera y publica la lista ordenada de libros de ese tema para fijar.\n\n"
+        "⚙️ **Administración & Organización:**\n"
+        "• `/registrar` — Responde a un mensaje antiguo que tenga un PDF o EPUB para clasificarlo e indexarlo de inmediato.\n"
+        "• `/settopic <Género>` — *(Ejecutar dentro de un tema)* Asigna ese tema manualmente a un género específico.\n"
+        "• `/start` — Ver estado del bot o vincular el grupo a la app LibroSync.\n"
+        "• `/help` — Ver este menú de ayuda.\n\n"
+        "✨ **Modo Cero Fricción:** No necesitas comandos para subir libros nuevos: ¡solo arrastra cualquier PDF o EPUB al chat y Griffin se encarga de todo!"
+    )
+    await message.reply_text(help_text, parse_mode="Markdown")
