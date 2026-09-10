@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str
     TELEGRAM_BOT_USERNAME: str = "Griffintor_bot"
     
+    # AI Classifier (Google Gemini)
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+
     # Database
     DATABASE_URL: str = f"sqlite+aiosqlite:///{BASE_DIR}/librosync.db"
     

@@ -1,7 +1,7 @@
 import logging
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
 from app.core.config import settings
-from app.bot.handlers import start_handler, document_handler
+from app.bot.handlers import start_handler, document_handler, set_topic_handler
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ def get_bot_application() -> Application:
         )
         # Registrar handlers
         _bot_application.add_handler(CommandHandler("start", start_handler))
+        _bot_application.add_handler(CommandHandler("settopic", set_topic_handler))
         _bot_application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
         logger.info("Handlers del bot de Telegram registrados exitosamente.")
     return _bot_application

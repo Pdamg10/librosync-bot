@@ -1,7 +1,7 @@
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 from telegram import Update
 from telegram.ext import (
@@ -19,21 +19,12 @@ from app.models.telegram_link import TelegramLink
 from app.models.book import Book
 from app.models.topic import Topic
 from app.services.telegram_service import get_chat_and_bot_status, move_or_repost_to_topic
-from app.services.topic_resolver import resolve_or_create_topic
+from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug
+from app.services.ai_classifier import classify_book_with_gemini
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".cbr", ".cbz"}
-
-def extract_genre_from_caption(caption: Optional[str]) -> Optional[str]:
-    """Extrae género si viene como hashtag (ej: #Romance, #CienciaFiccion)"""
-    if not caption:
-        return None
-    hashtags = re.findall(r"#(\w+)", caption)
-    if hashtags:
-        # Tomar el primer hashtag como género
-        return hashtags[0].replace("_", " ").title()
-    return None
 
 def clean_filename(filename: str) -> tuple[str, str]:
     """Separa el nombre base y la extensión limpia"""
@@ -50,7 +41,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     message = update.effective_message
     chat = update.effective_chat
-    user = update.effective_user
 
     if not message or not chat:
         return
@@ -147,15 +137,69 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "asegúrate de hacer al bot administrador con el permiso **'Administrar temas'**."
             )
         else:
-            msg_lines.append("🚀 Todo configurado al 100%. ¡Ya puedes enviar libros!")
+            msg_lines.append("🚀 ¡Motor de Inteligencia Artificial activo! Ya puedes enviar libros sin hashtags ni comandos.")
 
         await message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
 
+async def set_topic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando OPCIONAL: /settopic <NombreDelGenero>
+    Permite vincular un tema creado manualmente en Telegram a un género específico.
+    Se ejecuta DENTRO del tema que se desea mapear.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    thread_id = getattr(message, "message_thread_id", None)
+    if not thread_id:
+        await message.reply_text("⚠️ Este comando debe ejecutarse **dentro** del tema que deseas vincular.")
+        return
+
+    if not context.args:
+        await message.reply_text("Uso: `/settopic <Nombre del Género>` (ejemplo: `/settopic Dark Romance`)", parse_mode="Markdown")
+        return
+
+    genre_name = " ".join(context.args).strip().title()
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+        res = await session.execute(stmt)
+        link = res.scalar_one_or_none()
+
+        if not link:
+            await message.reply_text("❌ Este grupo no está vinculado a LibroSync. Vinclalo primero con `/start <codigo>`.")
+            return
+
+        # Buscar si ya existía registro para este thread_id o género
+        stmt_topic = select(Topic).where(
+            Topic.telegram_link_id == link.id,
+            Topic.topic_id == thread_id
+        )
+        t_res = await session.execute(stmt_topic)
+        existing_t = t_res.scalar_one_or_none()
+
+        if existing_t:
+            existing_t.genre = genre_name
+        else:
+            new_t = Topic(
+                telegram_link_id=link.id,
+                genre=genre_name,
+                topic_id=thread_id
+            )
+            session.add(new_t)
+
+        await session.commit()
+        await message.reply_text(f"✅ Tema asignado: a partir de ahora los libros de **{genre_name}** se archivarán aquí automáticamente.", parse_mode="Markdown")
+
+
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Detecta cuando se envía un archivo / documento (libro).
-    Lo clasifica, resuelve el topic correspondiente y lo registra en la base de datos.
+    Detecta cuando se envía un libro (PDF, EPUB, etc.).
+    Utiliza Gemini AI para extraer título, autor y clasificar el género de forma 100% autónoma.
+    No requiere hashtags ni comandos por parte del usuario.
     """
     message = update.effective_message
     chat = update.effective_chat
@@ -163,15 +207,15 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     doc = message.document
-    filename = doc.file_name or "libro_sin_nombre"
-    base_title, ext = clean_filename(filename)
+    filename = doc.file_name or "libro_desconocido"
+    base_raw, ext = clean_filename(filename)
 
     if f".{ext}" not in SUPPORTED_EXTENSIONS:
         logger.debug(f"Documento ignorado por extensión no soportada: {filename}")
         return
 
     async with AsyncSessionLocal() as session:
-        # Verificar si este chat está vinculado a LibroSync
+        # 1. Verificar vinculación del chat
         stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
         res = await session.execute(stmt)
         link = res.scalar_one_or_none()
@@ -180,51 +224,49 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Documento recibido en chat no vinculado ({chat.id}). Ignorando.")
             return
 
-        # Determinar género
-        # 1. Por hashtag en caption
-        genre = extract_genre_from_caption(message.caption)
+        # 2. Consultar lista de géneros ya existentes en este grupo
+        stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
+        topics_res = await session.execute(stmt_topics)
+        existing_topics_list = [t.genre for t in topics_res.scalars().all()]
 
-        # 2. Si se subió dentro de un topic específico existente
+        # 3. Clasificación inteligente con Gemini AI (Zero-friction)
+        logger.info(f"Clasificando libro '{filename}' con Gemini AI...")
+        classification = await classify_book_with_gemini(
+            filename=filename,
+            caption=message.caption,
+            existing_topics=existing_topics_list
+        )
+
+        title = classification["title"]
+        author = classification["author"]
+        genre = classification["genre"]
+
         current_thread_id = getattr(message, "message_thread_id", None)
-        if not genre and current_thread_id:
-            stmt_topic = select(Topic).where(
-                Topic.telegram_link_id == link.id,
-                Topic.topic_id == current_thread_id
-            )
-            topic_res = await session.execute(stmt_topic)
-            existing_topic = topic_res.scalar_one_or_none()
-            if existing_topic:
-                genre = existing_topic.genre
-
-        # Fallback a "General"
-        if not genre:
-            genre = "General"
-
         target_message_id = message.message_id
         assigned_topic_id = current_thread_id
 
-        # Auto-organización en supergrupos con topics
+        # 4. Auto-organización en supergrupos con temas
         if link.forum_enabled:
             topic_id = await resolve_or_create_topic(session, context.bot, link, genre)
             assigned_topic_id = topic_id
 
-            # Si se subió en el General o en un topic distinto, moverlo/copiarlo al topic del género
+            # Si el archivo se subió en el General o en un topic distinto, moverlo/copiarlo al topic del género
             if topic_id and current_thread_id != topic_id:
                 reposted_id = await move_or_repost_to_topic(
                     bot=context.bot,
                     chat_id=chat.id,
                     message_id=message.message_id,
                     topic_id=topic_id,
-                    delete_original=link.bot_is_admin  # Solo borrar si somos admin
+                    delete_original=link.bot_is_admin
                 )
                 if reposted_id:
                     target_message_id = reposted_id
 
-        # Registrar libro en la base de datos
+        # 5. Registrar en base de datos
         new_book = Book(
             user_id=link.user_id,
-            title=base_title.replace("_", " ").title(),
-            author="Desconocido",
+            title=title,
+            author=author,
             genre=genre,
             source="telegram",
             telegram_link_id=link.id,
@@ -237,4 +279,4 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.commit()
         await session.refresh(new_book)
 
-        logger.info(f"Libro registrado: '{new_book.title}' (ID {new_book.id}, Género: {new_book.genre})")
+        logger.info(f"Libro registrado: '{new_book.title}' por '{new_book.author}' -> Género: {new_book.genre}")
