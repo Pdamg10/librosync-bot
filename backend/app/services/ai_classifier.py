@@ -81,16 +81,6 @@ def fallback_parse_filename(
         title = parts[0].strip().replace("_", " ").title()
         author = parts[1].strip().replace("_", " ").title()
 
-    # Si se conoce el tema actual donde ya estaba el mensaje, mantenerlo
-    if current_topic_hint:
-        genre = current_topic_hint
-        return {
-            "title": title,
-            "author": author,
-            "genre": genre,
-            "emoji": get_genre_emoji(genre)
-        }
-
     # Helper local para comparar texto normalizado
     import unicodedata
     def _slug(s: str) -> str:
@@ -98,37 +88,41 @@ def fallback_parse_filename(
         return re.sub(r'[^a-zA-Z0-9]', '', nfkd).lower()
 
     file_slug = _slug(filename)
-    genre = "General"
+    genre = None
 
     if existing_topics:
-        # 1. Comprobar si el nombre de algún topic existente coincide con el archivo
-        for ex_t in existing_topics:
-            ex_slug = _slug(ex_t)
-            if ex_slug and (ex_slug in file_slug or file_slug in ex_slug):
-                genre = ex_t
-                break
-
-        # 2. Si sigue en General, comprobar palabras clave temáticas comunes
-        if genre == "General":
-            genre_keywords = {
-                "dark romance": ["dark", "lujuria", "mafia", "adeline", "pecado", "sombras", "enemiesto"],
-                "romance": ["amor", "love", "romance", "corazon", "pasion", "beso", "boda"],
-                "fantasia": ["fantasy", "fantasia", "magia", "dragon", "reino", "hada", "viento", "corte"],
-                "ciencia ficcion": ["scifi", "ciencia", "ficcion", "espacio", "galaxy", "futuro", "robot"],
-                "thriller": ["misterio", "asesin", "crimen", "detective", "sangre", "muerte", "suspens"],
-                "manga": ["manga", "manhwa", "manhua", "capitulo", "volumen"],
-                "dystopia": ["distopia", "dystopia", "apocalip", "caos", "juegos del hambre"],
-                "autoayuda": ["habitos", "autoayuda", "mente", "superacion", "exito", "finanzas"]
-            }
-            for kw_genre, kws in genre_keywords.items():
-                if any(kw in file_slug for kw in kws):
-                    target_kw_slug = _slug(kw_genre)
-                    for ex_t in existing_topics:
-                        if target_kw_slug in _slug(ex_t) or _slug(ex_t) in target_kw_slug:
-                            genre = ex_t
-                            break
-                    if genre != "General":
+        # 1. Palabras clave temáticas prioritarias para detectar si pertenece a otro género
+        genre_keywords = {
+            "dark romance": ["dark", "lujuria", "mafia", "adeline", "pecado", "sombras", "enemiesto"],
+            "romance": ["amor", "love", "romance", "corazon", "pasion", "beso", "boda"],
+            "fantasia": ["fantasy", "fantasia", "magia", "dragon", "reino", "hada", "viento", "corte", "potter", "anillos"],
+            "ciencia ficcion": ["scifi", "ciencia", "ficcion", "espacio", "galaxy", "futuro", "robot"],
+            "thriller": ["misterio", "asesin", "crimen", "detective", "sangre", "muerte", "suspens", "thriller"],
+            "manga": ["manga", "manhwa", "manhua", "capitulo", "volumen"],
+            "dystopia": ["distopia", "dystopia", "apocalip", "caos", "juegos del hambre"],
+            "autoayuda": ["habitos", "autoayuda", "mente", "superacion", "exito", "finanzas"]
+        }
+        for kw_genre, kws in genre_keywords.items():
+            if any(kw in file_slug for kw in kws):
+                target_kw_slug = _slug(kw_genre)
+                for ex_t in existing_topics:
+                    if target_kw_slug in _slug(ex_t) or _slug(ex_t) in target_kw_slug:
+                        genre = ex_t
                         break
+                if genre:
+                    break
+
+        # 2. Comprobar si el nombre literal de algún topic existente coincide con el archivo
+        if not genre:
+            for ex_t in existing_topics:
+                ex_slug = _slug(ex_t)
+                if ex_slug and (ex_slug in file_slug or file_slug in ex_slug):
+                    genre = ex_t
+                    break
+
+    # 3. Si no coincidió con ninguna palabra clave, usar current_topic_hint si existe o General
+    if not genre:
+        genre = current_topic_hint or "General"
 
     return {
         "title": title,
@@ -146,6 +140,7 @@ async def classify_book_with_gemini(
     """
     Clasifica un libro y extrae metadata limpia (título, autor, género) usando Google Gemini.
     Tiene en cuenta los temas ya existentes en el grupo para no duplicar.
+    Detecta activamente si un libro está en el tema incorrecto para reubicarlo.
     Maneja reintentos con backoff para evitar saturación de cuota HTTP 429.
     """
     if not settings.GEMINI_API_KEY:
@@ -154,7 +149,7 @@ async def classify_book_with_gemini(
 
     topics_list = existing_topics or []
     topics_formatted = json.dumps(topics_list, ensure_ascii=False) if topics_list else "Ninguno aún"
-    hint_str = f"\n- Contexto actual: Este archivo se encuentra actualmente dentro del tema '{current_topic_hint}'." if current_topic_hint else ""
+    hint_str = f"\n- Ubicación donde fue encontrado el mensaje: Tema '{current_topic_hint}'." if current_topic_hint else ""
 
     prompt = f"""
 Eres el bibliotecario y clasificador experto de una biblioteca digital en Telegram.
@@ -168,10 +163,11 @@ Lista de Temas (Topics) YA CREADOS en el grupo de Telegram:
 INSTRUCCIONES DE CLASIFICACIÓN:
 1. Identifica el Título real del libro. Elimina numeraciones iniciales de saga (ej: "01 - ", "[Vol 1] "), extensiones o tags de escaneo.
 2. Identifica el Autor real del libro. Si no se puede deducir del nombre, pon "Desconocido".
-3. Determina el Género literario exacto:
-   - PRIORIDAD MÁXIMA: Si el libro encaja o es afín a alguno de los "Temas YA CREADOS" en la lista, DEBES elegir EXACTAMENTE ese mismo nombre (respetando mayúsculas y espacios).
-   - Si no encaja en ninguno de los existentes, propón un nombre de género canónico, elegante y corto (ej: "Dark Romance", "Ciencia Ficción", "Fantasía", "Thriller", "Autoayuda", "Terror").
-   - NUNCA uses nombres genéricos vagos si puedes ser preciso (ej: prefiere "Dark Romance" o "Romance Histórico" si aplica).
+3. Determina el Género literario exacto del libro de forma OBJETIVA:
+   - ATENCIÓN - DETECCIÓN DE TEMA ERRÓNEO: Los usuarios con frecuencia suben libros en el tema equivocado (por ejemplo, suben un libro de 'Fantasía' o 'Thriller' en el tema de 'Romance'). NO te limites ni asumas que el tema donde fue encontrado es el correcto.
+   - Si el libro pertenece a otro de los 'Temas YA CREADOS' en la lista (por ejemplo, es Fantasía y existe el tema Fantasía), DEBES elegir EXACTAMENTE ese nombre para que el bot pueda reubicarlo automáticamente.
+   - Si no encaja en ningún tema existente, propón un nombre de género canónico, elegante y conciso (ej: "Dark Romance", "Ciencia Ficción", "Fantasía", "Thriller", "Autoayuda", "Terror") para que el bot cree un nuevo tema para el libro.
+   - NUNCA uses nombres genéricos vagos si puedes ser preciso.
 4. Elige un Emoji representativo del género (ej: 🖤 para Dark Romance, 🚀 para Ciencia Ficción, 🧙 para Fantasía, 🔪 para Thriller, 💖 para Romance, 📚 para General).
 
 Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:

@@ -410,16 +410,48 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"Libro registrado: '{new_book.title}' por '{new_book.author}' -> Género: {new_book.genre}")
 
-        # 6. Notificación visual en el tema de destino para feedback inmediato
-        if assigned_topic_id:
+        # 6. Notificación visual
+        clean_chat_id = str(chat.id).replace("-100", "")
+        dest_link = f"https://t.me/c/{clean_chat_id}/{target_message_id}"
+
+        # Si el libro fue subido en un tema incorrecto y se reubicó, avisar en el tema origen
+        if current_thread_id and assigned_topic_id and current_thread_id != assigned_topic_id:
             try:
                 await context.bot.send_message(
                     chat_id=chat.id,
+                    message_thread_id=current_thread_id,
+                    text=f"🔄 **Libro reubicado automáticamente:**\n\n"
+                         f"📖 **{title}** (*{author}*) pertenece a {suggested_emoji} **{genre}**.\n"
+                         f"Para mantener la biblioteca ordenada, ha sido trasladado a su tema correspondiente.\n\n"
+                         f"👉 [Pulsa aquí para ver el libro en {genre}]({dest_link})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            except Exception as orig_err:
+                logger.debug(f"No se pudo enviar aviso de reubicación en origen: {orig_err}")
+
+        # Notificación en el tema de destino
+        if assigned_topic_id:
+            try:
+                if current_thread_id and current_thread_id != assigned_topic_id:
+                    dest_text = (
+                        f"📚 **Libro sincronizado y archivado:**\n\n"
+                        f"📖 **Título:** {title}\n"
+                        f"✍️ **Autor:** {author}\n"
+                        f"🏷️ **Género:** {suggested_emoji} **{genre}**\n\n"
+                        f"*(Reubicado automáticamente desde otro tema donde no correspondía)*"
+                    )
+                else:
+                    dest_text = (
+                        f"📚 **Libro sincronizado y archivado:**\n\n"
+                        f"📖 **Título:** {title}\n"
+                        f"✍️ **Autor:** {author}\n"
+                        f"🏷️ **Género:** {suggested_emoji} **{genre}**"
+                    )
+                await context.bot.send_message(
+                    chat_id=chat.id,
                     message_thread_id=assigned_topic_id,
-                    text=f"📚 **Libro sincronizado y archivado**\n\n"
-                         f"📖 **Título:** {title}\n"
-                         f"✍️ **Autor:** {author}\n"
-                         f"🏷️ **Género:** {genre}",
+                    text=dest_text,
                     parse_mode="Markdown"
                 )
             except Exception as notify_err:
@@ -722,8 +754,9 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
                 await status_msg.edit_text("❌ Este grupo no está vinculado a LibroSync.")
                 return
 
-            # 1. Deduplicación Rápida por file_unique_id
+            # 1. Comprobar si ya existe en BD por file_unique_id
             file_unique_id = getattr(doc, "file_unique_id", None)
+            existing_book = None
             if file_unique_id:
                 stmt_dup = select(Book).where(
                     Book.telegram_link_id == link.id,
@@ -731,21 +764,8 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 dup_res = await session.execute(stmt_dup)
                 existing_book = dup_res.scalar_one_or_none()
-                if existing_book and existing_book.telegram_message_id:
-                    clean_chat_id = str(chat.id).replace("-100", "")
-                    msg_link = f"https://t.me/c/{clean_chat_id}/{existing_book.telegram_message_id}"
-                    await status_msg.edit_text(
-                        f"ℹ️ **Este libro ya se encuentra registrado en la biblioteca:**\n\n"
-                        f"📖 **{existing_book.title}**\n"
-                        f"✍️ *{existing_book.author}*\n"
-                        f"🏷️ Tema: **{existing_book.genre}** (`.{existing_book.file_format.upper()}`)\n\n"
-                        f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-                    return
 
-            # 2. Obtener contexto del thread actual (si el libro o el comando ya están dentro de un tema)
+            # 2. Contexto del thread actual (dónde se ejecutó el comando o está el mensaje)
             current_thread_id = getattr(target_msg, "message_thread_id", None) or getattr(message, "message_thread_id", None)
             current_topic_hint = None
             if current_thread_id:
@@ -763,7 +783,7 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
             topics_res = await session.execute(stmt_topics)
             existing_topics_list = [t.genre for t in topics_res.scalars().all()]
 
-            # 4. Clasificar con Gemini (con reintentos y contexto de thread)
+            # 4. Clasificar con Gemini (detección objetiva del género real)
             classification = await classify_book_with_gemini(
                 filename=filename,
                 caption=target_msg.caption,
@@ -776,7 +796,87 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
             genre = classification["genre"]
             suggested_emoji = classification.get("emoji", "📖")
 
-            # 4.1 Deduplicación Semántica (Título + Formato)
+            # Caso 4.1: El libro ya estaba en BD pero con un género erróneo -> Reclasificar y Reubicar
+            if existing_book and existing_book.telegram_message_id:
+                if normalize_genre_slug(existing_book.genre) == normalize_genre_slug(genre):
+                    clean_chat_id = str(chat.id).replace("-100", "")
+                    msg_link = f"https://t.me/c/{clean_chat_id}/{existing_book.telegram_message_id}"
+                    await status_msg.edit_text(
+                        f"ℹ️ **Este libro ya se encuentra correctamente registrado en la biblioteca:**\n\n"
+                        f"📖 **{existing_book.title}**\n"
+                        f"✍️ *{existing_book.author}*\n"
+                        f"🏷️ Tema: **{existing_book.genre}** (`.{existing_book.file_format.upper()}`)\n\n"
+                        f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                    return
+                else:
+                    # El género cambió: mover al tema correcto
+                    logger.info(f"Reclasificando libro '{existing_book.title}': de '{existing_book.genre}' a '{genre}'")
+                    old_genre_name = existing_book.genre
+                    target_message_id = existing_book.telegram_message_id
+
+                    if link.forum_enabled:
+                        topic_id = await resolve_or_create_topic(
+                            session=session,
+                            bot=context.bot,
+                            telegram_link=link,
+                            genre=genre,
+                            suggested_emoji=suggested_emoji
+                        )
+                        if topic_id and current_thread_id != topic_id:
+                            try:
+                                reposted_id = await move_or_repost_to_topic(
+                                    bot=context.bot,
+                                    chat_id=chat.id,
+                                    message_id=target_msg.message_id,
+                                    topic_id=topic_id,
+                                    delete_original=link.bot_is_admin
+                                )
+                                if reposted_id:
+                                    target_message_id = reposted_id
+                            except ThreadNotFoundError:
+                                await delete_topic_by_thread_id(session, link.id, topic_id)
+                                emoji = get_genre_emoji(genre, suggested_emoji)
+                                new_created = await context.bot.create_forum_topic(chat_id=chat.id, name=f"{emoji} {genre}"[:128])
+                                new_topic = Topic(telegram_link_id=link.id, genre=genre, topic_id=new_created.message_thread_id)
+                                session.add(new_topic)
+                                await session.commit()
+                                await session.refresh(new_topic)
+                                reposted_id = await move_or_repost_to_topic(
+                                    bot=context.bot,
+                                    chat_id=chat.id,
+                                    message_id=target_msg.message_id,
+                                    topic_id=new_created.message_thread_id,
+                                    delete_original=link.bot_is_admin
+                                )
+                                if reposted_id:
+                                    target_message_id = reposted_id
+
+                    existing_book.title = title
+                    existing_book.author = author
+                    existing_book.genre = genre
+                    existing_book.telegram_message_id = target_message_id
+                    await session.commit()
+                    await session.refresh(existing_book)
+
+                    clean_chat_id = str(chat.id).replace("-100", "")
+                    link_url = f"https://t.me/c/{clean_chat_id}/{target_message_id}"
+                    await status_msg.edit_text(
+                        f"🔄 **¡Libro reclasificado y reubicado con éxito!**\n\n"
+                        f"📖 **Título:** {title}\n"
+                        f"✍️ **Autor:** {author}\n"
+                        f"🏷️ **Tema anterior:** {old_genre_name}\n"
+                        f"🏷️ **Nuevo tema corregido:** {suggested_emoji} **{genre}** (`.{ext.upper()}`)\n\n"
+                        f"*(El libro fue trasladado a su tema correspondiente)*\n\n"
+                        f"👉 [Ir al libro en {genre}]({link_url})",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                    return
+
+            # 4.2 Deduplicación Semántica (Título + Formato)
             new_title_slug = normalize_genre_slug(title)
             stmt_books = select(Book).where(Book.telegram_link_id == link.id)
             books_res = await session.execute(stmt_books)
@@ -790,18 +890,19 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
 
             if matching_book:
                 if matching_book.file_format.lower() == ext.lower():
-                    clean_chat_id = str(chat.id).replace("-100", "")
-                    msg_link = f"https://t.me/c/{clean_chat_id}/{matching_book.telegram_message_id}"
-                    await status_msg.edit_text(
-                        f"ℹ️ **Este libro ya se encuentra registrado en la biblioteca:**\n\n"
-                        f"📖 **{matching_book.title}**\n"
-                        f"✍️ *{matching_book.author}*\n"
-                        f"🏷️ Tema: **{matching_book.genre}** (`.{matching_book.file_format.upper()}`)\n\n"
-                        f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-                    return
+                    if normalize_genre_slug(matching_book.genre) == normalize_genre_slug(genre):
+                        clean_chat_id = str(chat.id).replace("-100", "")
+                        msg_link = f"https://t.me/c/{clean_chat_id}/{matching_book.telegram_message_id}"
+                        await status_msg.edit_text(
+                            f"ℹ️ **Este libro ya se encuentra registrado en la biblioteca:**\n\n"
+                            f"📖 **{matching_book.title}**\n"
+                            f"✍️ *{matching_book.author}*\n"
+                            f"🏷️ Tema: **{matching_book.genre}** (`.{matching_book.file_format.upper()}`)\n\n"
+                            f"👉 [Pulsa aquí para ir al libro en el tema]({msg_link})",
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True
+                        )
+                        return
                 else:
                     # Formato complementario (ej: ya había EPUB y ahora registran PDF)
                     genre = matching_book.genre
@@ -820,7 +921,7 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 assigned_topic_id = topic_id
 
-                # Si el libro viejo no estaba en el topic asignado, copiarlo allí
+                # Si el libro viejo no estaba en el topic asignado, moverlo allí
                 if topic_id and current_thread_id != topic_id:
                     try:
                         reposted_id = await move_or_repost_to_topic(
@@ -828,7 +929,7 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
                             chat_id=chat.id,
                             message_id=target_msg.message_id,
                             topic_id=topic_id,
-                            delete_original=False  # No borrar el mensaje histórico original por seguridad
+                            delete_original=link.bot_is_admin  # Si es admin, limpiar el tema incorrecto
                         )
                         if reposted_id:
                             target_message_id = reposted_id
@@ -850,7 +951,7 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
                             chat_id=chat.id,
                             message_id=target_msg.message_id,
                             topic_id=new_created.message_thread_id,
-                            delete_original=False
+                            delete_original=link.bot_is_admin
                         )
                         if reposted_id:
                             target_message_id = reposted_id
@@ -876,12 +977,26 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
             clean_chat_id = str(chat.id).replace("-100", "")
             link_url = f"https://t.me/c/{clean_chat_id}/{target_message_id}"
 
+            if current_thread_id and assigned_topic_id and current_thread_id != assigned_topic_id:
+                status_text = (
+                    f"🔄 **¡Libro detectado y reubicado con éxito!**\n\n"
+                    f"📖 **Título:** {title}\n"
+                    f"✍️ **Autor:** {author}\n"
+                    f"🏷️ **Tema asignado:** {suggested_emoji} **{genre}** (`.{ext.upper()}`)\n\n"
+                    f"*(El libro estaba ubicado en otro tema y fue trasladado automáticamente a {genre})*\n\n"
+                    f"👉 [Ir al libro en {genre}]({link_url})"
+                )
+            else:
+                status_text = (
+                    f"✅ **¡Libro antiguo registrado con éxito!**\n\n"
+                    f"📖 **Título:** {title}\n"
+                    f"✍️ **Autor:** {author}\n"
+                    f"🏷️ **Tema:** {suggested_emoji} **{genre}** (`.{ext.upper()}`)\n\n"
+                    f"👉 [Ir al libro]({link_url})"
+                )
+
             await status_msg.edit_text(
-                f"✅ **¡Libro antiguo registrado con éxito!**\n\n"
-                f"📖 **Título:** {title}\n"
-                f"✍️ **Autor:** {author}\n"
-                f"🏷️ **Tema:** {suggested_emoji} **{genre}** (`.{ext.upper()}`)\n\n"
-                f"👉 [Ir al libro]({link_url})",
+                status_text,
                 parse_mode="Markdown",
                 disable_web_page_preview=True
             )

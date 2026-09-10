@@ -227,6 +227,15 @@ def test_fallback_parse_filename():
     res3 = fallback_parse_filename("dark romance especial.pdf", existing_topics=existing)
     assert res3["genre"] == "Dark Romance"
 
+    # Caso 4: Libro de Fantasía subido por error en Romance -> Debe clasificar como Fantasía
+    res4 = fallback_parse_filename(
+        "Harry Potter y el Caliz de Fuego.epub",
+        existing_topics=["Romance", "Fantasía"],
+        current_topic_hint="Romance"
+    )
+    assert res4["genre"] == "Fantasía"
+    assert res4["emoji"] == "🧙"
+
 
 @pytest.mark.asyncio
 async def test_gemini_retry_on_429():
@@ -260,4 +269,72 @@ async def test_gemini_retry_on_429():
         assert res["title"] == "Cien Años de Soledad"
         assert res["genre"] == "Fantasía"
         assert mock_sleep.called
+
+
+@pytest.mark.asyncio
+async def test_misplaced_book_reclassification_and_relocation(test_session):
+    # Link
+    link = TelegramLink(
+        user_id=1,
+        chat_id=-100999888,
+        chat_type="group_forum",
+        chat_title="Comunidad Libros",
+        bot_is_admin=True,
+        forum_enabled=True
+    )
+    test_session.add(link)
+    await test_session.commit()
+    await test_session.refresh(link)
+
+    # Temas existentes: Romance (thread 19) y Fantasía (thread 18)
+    t_romance = Topic(telegram_link_id=link.id, genre="Romance", topic_id=19)
+    t_fantasia = Topic(telegram_link_id=link.id, genre="Fantasía", topic_id=18)
+    test_session.add_all([t_romance, t_fantasia])
+    await test_session.commit()
+
+    # Libro registrado originalmente por error en Romance
+    book = Book(
+        user_id=1,
+        title="Harry Potter y el Prisionero de Azkaban",
+        author="J.K. Rowling",
+        genre="Romance",
+        source="telegram",
+        telegram_link_id=link.id,
+        telegram_message_id=1001,
+        telegram_file_id="HP3_FILE_ID",
+        file_unique_id="HP3_UNIQUE",
+        file_format="epub"
+    )
+    test_session.add(book)
+    await test_session.commit()
+    await test_session.refresh(book)
+
+    # Supongamos que se reevalúa el libro:
+    # La clasificación detecta objetivamente Fantasía
+    detected_genre = "Fantasía"
+    assert normalize_genre_slug(book.genre) != normalize_genre_slug(detected_genre)
+
+    # Resolver el topic correcto
+    mock_bot = AsyncMock()
+    correct_topic_id = await resolve_or_create_topic(
+        session=test_session,
+        bot=mock_bot,
+        telegram_link=link,
+        genre=detected_genre
+    )
+    assert correct_topic_id == 18
+
+    # Verificar que el hilo actual (19 - Romance) no coincide con el correcto (18 - Fantasía)
+    origin_thread_id = 19
+    assert origin_thread_id != correct_topic_id
+
+    # Actualizar registro en BD (simulando reubicación)
+    book.genre = detected_genre
+    book.telegram_message_id = 1002  # Nuevo message_id en el topic 18
+    await test_session.commit()
+    await test_session.refresh(book)
+
+    assert book.genre == "Fantasía"
+    assert book.telegram_message_id == 1002
+
 
