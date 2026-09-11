@@ -8,6 +8,7 @@ import {
   ScrollView,
   Alert,
   ActivityIndicator,
+  SafeAreaView,
 } from 'react-native';
 import { getApiBaseUrl, setApiBaseUrl, checkServerHealth } from '../services/api';
 import { useResponsive } from '../hooks/useResponsive';
@@ -144,52 +145,37 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onOpenDrawer }) 
             </View>
           )}
         </View>
-            style={styles.testBtn}
-          >
-            {testing ? (
-              <ActivityIndicator color="#ffffff" size="small" />
-            ) : (
-              <Text style={styles.testBtnText}>⚡ Probar Conexión</Text>
-            )}
-          </TouchableOpacity>
+
+        {/* Device & Layout Diagnostic Card */}
+        <View style={[styles.card, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
+          <Text style={[styles.cardTitle, { color: c.textPrimary }]}>📱 Diagnóstico de Pantalla</Text>
+          <View style={styles.diagRow}>
+            <Text style={[styles.diagLabel, { color: c.textSecondary }]}>Dispositivo:</Text>
+            <Text style={[styles.diagValue, { color: c.textPrimary }]}>
+              {isTablet ? 'Tablet / Pantalla Grande 🖥️' : 'Teléfono Móvil 📱'}
+            </Text>
+          </View>
+          <View style={styles.diagRow}>
+            <Text style={[styles.diagLabel, { color: c.textSecondary }]}>Resolución:</Text>
+            <Text style={[styles.diagValue, { color: c.textPrimary }]}>{Math.round(width)} x {Math.round(height)} px</Text>
+          </View>
+          <View style={styles.diagRow}>
+            <Text style={[styles.diagLabel, { color: c.textSecondary }]}>Columnas en Catálogo:</Text>
+            <Text style={[styles.diagValue, { color: c.textPrimary }]}>{numColumns} columnas adaptativas</Text>
+          </View>
         </View>
 
-        {serverStatus && (
-          <View style={styles.statusBox}>
-            <Text style={styles.statusText}>{serverStatus}</Text>
-          </View>
-        )}
-      </View>
-
-      {/* Device & Layout Diagnostic Card */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>📱 Diagnóstico de Pantalla</Text>
-        <View style={styles.diagRow}>
-          <Text style={styles.diagLabel}>Dispositivo:</Text>
-          <Text style={styles.diagValue}>
-            {isTablet ? 'Tablet / Pantalla Grande 🖥️' : 'Teléfono Móvil 📱'}
+        {/* About App */}
+        <View style={[styles.card, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
+          <Text style={[styles.cardTitle, { color: c.textPrimary }]}>ℹ️ Acerca de Anaquel</Text>
+          <Text style={[styles.aboutText, { color: c.textSecondary }]}>
+            Versión: 1.0.0{'\n'}
+            Cada libro en su estante, dentro de Telegram.{'\n'}
+            Organizador inteligente de lectura con Inteligencia Artificial para teléfonos y tablets.
           </Text>
         </View>
-        <View style={styles.diagRow}>
-          <Text style={styles.diagLabel}>Resolución:</Text>
-          <Text style={styles.diagValue}>{Math.round(width)} x {Math.round(height)} px</Text>
-        </View>
-        <View style={styles.diagRow}>
-          <Text style={styles.diagLabel}>Columnas en Catálogo:</Text>
-          <Text style={styles.diagValue}>{numColumns} columnas adaptativas</Text>
-        </View>
-      </View>
-
-      {/* About App */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>ℹ️ Acerca de Anaquel</Text>
-        <Text style={styles.aboutText}>
-          Versión: 1.0.0{'\n'}
-          Cada libro en su estante, dentro de Telegram.{'\n'}
-          Organizador inteligente de lectura con Inteligencia Artificial para teléfonos y tablets.
-        </Text>
-      </View>
-    </ScrollView>
+      </ScrollView>
+    </SafeAreaView>
   );
 };
 
@@ -197,6 +183,40 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0f172a',
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+  },
+  headerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  menuBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  menuIcon: {
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  headerSubtitle: {
+    fontSize: 12,
+  },
+  scroll: {
+    flex: 1,
   },
   content: {
     padding: 16,
