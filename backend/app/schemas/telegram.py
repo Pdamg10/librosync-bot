@@ -8,6 +8,7 @@ class LinkCodeCreate(BaseModel):
 class LinkCodeResponse(BaseModel):
     code: str
     deep_link: str
+    group_link: Optional[str] = None
     expires_at: datetime
 
 class TelegramLinkOut(BaseModel):

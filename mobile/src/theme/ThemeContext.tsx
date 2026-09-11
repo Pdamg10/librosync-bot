@@ -293,8 +293,8 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       : colors.some((c) => isColorDark(c));
 
     const resolvedColors = isDark
-      ? { ...DARK_OBSIDIAN_COLORS, canvasBg: colors[colors.length - 1] }
-      : { ...LIGHT_CREAM_COLORS, canvasBg: colors[colors.length - 1] };
+      ? { ...DARK_OBSIDIAN_COLORS, canvasBg: 'transparent' }
+      : { ...LIGHT_CREAM_COLORS, canvasBg: 'transparent' };
 
     const nextTheme: CustomThemeState = {
       ...theme,
@@ -330,7 +330,8 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     opacity = 0.45,
     isDark = true
   ) => {
-    const resolvedColors = isDark ? DARK_OBSIDIAN_COLORS : LIGHT_CREAM_COLORS;
+    const baseColors = isDark ? DARK_OBSIDIAN_COLORS : LIGHT_CREAM_COLORS;
+    const resolvedColors = { ...baseColors, canvasBg: 'transparent' };
 
     const nextTheme: CustomThemeState = {
       ...theme,
@@ -346,14 +347,15 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const toggleContrastMode = () => {
     const nextDark = !theme.isDark;
-    const nextColors = nextDark ? DARK_OBSIDIAN_COLORS : LIGHT_CREAM_COLORS;
+    const baseColors = nextDark ? DARK_OBSIDIAN_COLORS : LIGHT_CREAM_COLORS;
+    const nextColors = {
+      ...baseColors,
+      canvasBg: theme.backgroundType === 'solid' ? theme.solidColor : 'transparent',
+    };
     const nextTheme: CustomThemeState = {
       ...theme,
       isDark: nextDark,
-      colors: {
-        ...nextColors,
-        canvasBg: theme.backgroundType === 'solid' ? theme.solidColor : nextColors.canvasBg,
-      },
+      colors: nextColors,
     };
     saveThemeState(nextTheme);
   };

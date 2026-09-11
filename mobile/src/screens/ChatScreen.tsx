@@ -190,7 +190,7 @@ export function ChatScreen({
   };
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: c.canvasBg }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: 'transparent' }]}>
       {/* Header del Chat */}
       <View style={[styles.header, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
         <View style={styles.headerLeft}>

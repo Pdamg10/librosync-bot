@@ -29,6 +29,7 @@ export interface TelegramLink {
 export interface LinkCodeResponse {
   code: string;
   deep_link: string;
+  group_link?: string;
   expires_at: string;
 }
 

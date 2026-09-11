@@ -52,26 +52,30 @@ export function AppBackground({ children, style, ...rest }: AppBackgroundProps) 
       )}
 
       {/* 2. Fondo Degradado Suave Dinámico con N colores en SVG */}
-      {theme.backgroundType === 'gradient' && (
-        <Svg style={StyleSheet.absoluteFill} width="100%" height="100%">
-          <Defs>
-            <LinearGradient id="appMultiGradientBg" x1="0%" y1="0%" x2="0%" y2="100%">
-              {gradientStops.map((col, idx) => {
-                const pct = Math.round((idx / Math.max(1, numStops - 1)) * 100);
-                return (
-                  <Stop
-                    key={`${idx}-${col}`}
-                    offset={`${pct}%`}
-                    stopColor={col}
-                    stopOpacity="1"
-                  />
-                );
-              })}
-            </LinearGradient>
-          </Defs>
-          <Rect x="0" y="0" width="100%" height="100%" fill="url(#appMultiGradientBg)" />
-        </Svg>
-      )}
+      {theme.backgroundType === 'gradient' && (() => {
+        const gradKey = gradientStops.map((s) => s.replace('#', '')).join('_');
+        const gradId = `appGrad_${gradKey}`;
+        return (
+          <Svg key={`svg_bg_${gradKey}`} style={StyleSheet.absoluteFill} width="100%" height="100%">
+            <Defs>
+              <LinearGradient id={gradId} x1="0%" y1="0%" x2="0%" y2="100%">
+                {gradientStops.map((col, idx) => {
+                  const pct = Math.round((idx / Math.max(1, numStops - 1)) * 100);
+                  return (
+                    <Stop
+                      key={`stop_${idx}_${col}`}
+                      offset={`${pct}%`}
+                      stopColor={col}
+                      stopOpacity="1"
+                    />
+                  );
+                })}
+              </LinearGradient>
+            </Defs>
+            <Rect x="0" y="0" width="100%" height="100%" fill={`url(#${gradId})`} />
+          </Svg>
+        );
+      })()}
 
       {/* 3. Fondo Imagen o GIF */}
       {(theme.backgroundType === 'image' || theme.backgroundType === 'gif') && theme.mediaUri && (

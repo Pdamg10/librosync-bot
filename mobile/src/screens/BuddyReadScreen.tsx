@@ -144,7 +144,7 @@ export function BuddyReadScreen({
   };
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: c.canvasBg }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: 'transparent' }]}>
       {/* Header Superior */}
       <View style={[styles.header, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
         <View style={styles.headerLeft}>

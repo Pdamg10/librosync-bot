@@ -69,10 +69,13 @@ function MainApp() {
   };
 
   return (
-    <SafeAreaView style={[styles.safeArea, { backgroundColor: currentColors.canvasBg }]} edges={['top', 'left', 'right']}>
-      <StatusBar barStyle={currentColors.statusBar} backgroundColor={currentColors.canvasBg} />
-
-      <AppBackground style={styles.backgroundWrapper}>
+    <AppBackground style={styles.backgroundWrapper}>
+      <StatusBar
+        barStyle={currentColors.statusBar}
+        backgroundColor={theme.backgroundType === 'solid' ? currentColors.canvasBg : 'transparent'}
+        translucent={theme.backgroundType !== 'solid'}
+      />
+      <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
         {/* Barra Lateral Desplegable Única (Drawer con todas las opciones) */}
         <SidebarDrawer
           isOpen={isDrawerOpen}
@@ -139,8 +142,8 @@ function MainApp() {
             )}
           </View>
         </View>
-      </AppBackground>
-    </SafeAreaView>
+      </SafeAreaView>
+    </AppBackground>
   );
 }
 

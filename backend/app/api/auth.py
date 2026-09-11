@@ -30,7 +30,7 @@ async def generate_link_code(payload: LinkCodeCreate, db: AsyncSession = Depends
         await db.commit()
         await db.refresh(user)
 
-    code = secrets.token_urlsafe(12)
+    code = secrets.token_hex(4).upper()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.LINK_CODE_TTL_MINUTES)
 
     link_code = LinkCode(
@@ -43,9 +43,11 @@ async def generate_link_code(payload: LinkCodeCreate, db: AsyncSession = Depends
     await db.commit()
 
     deep_link = f"https://t.me/{settings.TELEGRAM_BOT_USERNAME}?start={code}"
+    group_link = f"https://t.me/{settings.TELEGRAM_BOT_USERNAME}?startgroup={code}"
 
     return LinkCodeResponse(
         code=code,
         deep_link=deep_link,
+        group_link=group_link,
         expires_at=expires_at
     )

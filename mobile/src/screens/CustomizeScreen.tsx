@@ -10,6 +10,7 @@ import {
   Alert,
   TextInput,
 } from 'react-native';
+import Svg, { Defs, LinearGradient, Stop, Rect } from 'react-native-svg';
 import * as DocumentPicker from 'expo-document-picker';
 import {
   useAppTheme,
@@ -93,7 +94,7 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
   const currentColors = theme.colors;
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: currentColors.canvasBg }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: 'transparent' }]}>
       {/* Header */}
       <View style={[styles.header, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}>
         <View style={styles.headerLeft}>
@@ -208,9 +209,47 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
             {
               backgroundColor: currentColors.cardBg,
               borderColor: currentColors.cardBorder,
+              overflow: 'hidden',
             },
           ]}
         >
+          {/* Fondo sólido en preview */}
+          {theme.backgroundType === 'solid' && (
+            <View
+              style={[
+                StyleSheet.absoluteFill,
+                { backgroundColor: theme.solidColor },
+              ]}
+            />
+          )}
+
+          {/* Fondo degradado SVG dinámico en preview */}
+          {theme.backgroundType === 'gradient' && (() => {
+            const previewGradKey = theme.gradientColors.map((s) => s.replace('#', '')).join('_');
+            const previewGradId = `prevGrad_${previewGradKey}`;
+            const numStops = theme.gradientColors.length;
+            return (
+              <Svg key={`prev_svg_${previewGradKey}`} style={StyleSheet.absoluteFill} width="100%" height="100%">
+                <Defs>
+                  <LinearGradient id={previewGradId} x1="0%" y1="0%" x2="0%" y2="100%">
+                    {theme.gradientColors.map((col, idx) => {
+                      const pct = Math.round((idx / Math.max(1, numStops - 1)) * 100);
+                      return (
+                        <Stop
+                          key={`prev_stop_${idx}_${col}`}
+                          offset={`${pct}%`}
+                          stopColor={col}
+                          stopOpacity="1"
+                        />
+                      );
+                    })}
+                  </LinearGradient>
+                </Defs>
+                <Rect x="0" y="0" width="100%" height="100%" fill={`url(#${previewGradId})`} />
+              </Svg>
+            );
+          })()}
+
           {theme.mediaUri && (theme.backgroundType === 'image' || theme.backgroundType === 'gif') && (
             <Image
               source={{ uri: theme.mediaUri }}

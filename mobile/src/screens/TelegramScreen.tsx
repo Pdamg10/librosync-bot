@@ -32,16 +32,19 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
   const [links, setLinks] = useState<TelegramLink[]>([]);
   const [linkCodeData, setLinkCodeData] = useState<LinkCodeResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [generating, setGenerating] = useState<boolean>(false);
   const [syncing, setSyncing] = useState<boolean>(false);
 
   const loadLinks = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const data = await fetchTelegramLinks();
       setLinks(data);
     } catch (err: any) {
       console.warn('Error al cargar vínculos de Telegram:', err);
+      setLoadError(err.message || 'No se pudo conectar con el servidor.');
     } finally {
       setLoading(false);
     }
@@ -73,9 +76,19 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
       const res = await generateLinkCode();
       setLinkCodeData(res);
     } catch (err: any) {
-      Alert.alert('Error', 'No se pudo generar el código: ' + err.message);
+      Alert.alert('Error', 'No se pudo generar el código: ' + (err.message || 'Error de red'));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const handleOpenGroupTelegram = async () => {
+    if (!linkCodeData) return;
+    const url = linkCodeData.group_link || `https://t.me/Griffintor_bot?startgroup=${linkCodeData.code}`;
+    try {
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert('Enlace para Grupo', `Abre este enlace en Telegram:\n${url}`);
     }
   };
 
@@ -90,9 +103,10 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
 
   const handleShareLink = async () => {
     if (!linkCodeData) return;
+    const linkToShare = linkCodeData.group_link || linkCodeData.deep_link;
     try {
       await Share.share({
-        message: `🤖 Vincular grupo a LibroSync / Anaquel con este enlace:\n${linkCodeData.deep_link}\n\nO envía en el grupo:\n/enlazar ${linkCodeData.code}`,
+        message: `🤖 Conecta tu grupo a Anaquel con este enlace:\n${linkToShare}\n\nO envía en el grupo:\n/enlazar ${linkCodeData.code}`,
       });
     } catch (err) {
       console.warn('Error compartiendo:', err);
@@ -100,7 +114,7 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
   };
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: c.canvasBg }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: 'transparent' }]}>
       {/* Header */}
       <View style={[styles.header, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
         <View style={styles.headerLeft}>
@@ -124,6 +138,24 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+        {/* Banner de Error si no hay conexión */}
+        {loadError && (
+          <View style={[styles.errorCard, { backgroundColor: '#FEE2E2', borderColor: '#FCA5A5' }]}>
+            <Text style={{ fontSize: 18 }}>⚠️</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: '#991B1B', fontWeight: '700', fontSize: 13 }}>
+                Sin conexión con el servidor
+              </Text>
+              <Text style={{ color: '#B91C1C', fontSize: 12, marginTop: 2, lineHeight: 16 }}>
+                {loadError}. Asegúrate de que tu teléfono y tu PC estén en la misma red Wi-Fi y el servidor esté activo.
+              </Text>
+              <TouchableOpacity onPress={loadLinks} style={styles.errorRetryBtn}>
+                <Text style={styles.errorRetryText}>↻ Reintentar Conexión</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
         {/* Banner de Aislamiento Estricto por Grupo */}
         <View style={[styles.isolationNoticeCard, { backgroundColor: '#FEF3C7', borderColor: '#FDE68A' }]}>
           <View style={styles.isolationHeader}>
@@ -140,10 +172,10 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
         {/* TARJETA 1: GENERACIÓN DEL CÓDIGO ÚNICO POR CUENTA */}
         <View style={[styles.card, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
           <Text style={[styles.cardTitle, { color: c.textPrimary }]}>
-            🔑 Código Único de Administrador
+            🔑 Código de Enlace para Grupos
           </Text>
           <Text style={[styles.cardDesc, { color: c.textSecondary }]}>
-            Genera un código único exclusivo para tu cuenta. Con él autorizas a Griffin a organizar y clasificar libros en tu grupo de Telegram.
+            Genera un código exclusivo para autorizar a Griffin IA en tu grupo de Telegram.
           </Text>
 
           {linkCodeData ? (
@@ -162,22 +194,34 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
                 <Text style={[styles.commandSnippetCode, { color: c.textPrimary }]}>
                   /enlazar {linkCodeData.code}
                 </Text>
+                <Text style={[styles.commandSnippetSub, { color: c.textSecondary }]}>
+                  💡 O simplemente envía /enlazar dentro de tu grupo
+                </Text>
               </View>
 
-              <View style={styles.btnRow}>
+              <View style={styles.btnCol}>
                 <TouchableOpacity
-                  onPress={handleOpenTelegram}
+                  onPress={handleOpenGroupTelegram}
                   style={[styles.actionBtn, { backgroundColor: c.accent }]}
                 >
-                  <Text style={styles.actionBtnText}>👉 Abrir Bot en Telegram</Text>
+                  <Text style={styles.actionBtnText}>👥 Añadir Bot a Grupo de Telegram</Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity
-                  onPress={handleShareLink}
-                  style={[styles.shareBtn, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
-                >
-                  <Text style={[styles.shareBtnText, { color: c.textPrimary }]}>📤 Compartir</Text>
-                </TouchableOpacity>
+                <View style={styles.btnRow}>
+                  <TouchableOpacity
+                    onPress={handleOpenTelegram}
+                    style={[styles.subActionBtn, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
+                  >
+                    <Text style={[styles.subActionBtnText, { color: c.textPrimary }]}>💬 Abrir Bot Privado</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    onPress={handleShareLink}
+                    style={[styles.subActionBtn, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
+                  >
+                    <Text style={[styles.subActionBtnText, { color: c.textPrimary }]}>📤 Compartir</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
 
               <Text style={[styles.expiryNote, { color: c.textSecondary }]}>
@@ -314,7 +358,7 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
               <Text style={[styles.stepNumberText, { color: c.textPrimary }]}>2</Text>
             </View>
             <Text style={[styles.stepDesc, { color: c.textSecondary }]}>
-              Añade a <Text style={{ fontWeight: '700', color: c.textPrimary }}>@LibroSyncBot</Text> como administrador con el permiso de <Text style={{ fontWeight: '700', color: c.textPrimary }}>"Administrar temas"</Text>.
+              Añade a <Text style={{ fontWeight: '700', color: c.textPrimary }}>@Griffintor_bot</Text> como administrador con el permiso de <Text style={{ fontWeight: '700', color: c.textPrimary }}>"Administrar temas"</Text>.
             </Text>
           </View>
 
@@ -323,7 +367,7 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
               <Text style={[styles.stepNumberText, { color: c.textPrimary }]}>3</Text>
             </View>
             <Text style={[styles.stepDesc, { color: c.textSecondary }]}>
-              Genera tu código en esta pantalla y envía <Text style={{ fontWeight: '700', color: c.accent }}>/enlazar &lt;codigo&gt;</Text> en el grupo. ¡Listo!
+              Envía <Text style={{ fontWeight: '700', color: c.accent }}>/enlazar</Text> en el grupo (o <Text style={{ fontWeight: '700', color: c.accent }}>/enlazar &lt;codigo&gt;</Text> si generaste uno). ¡Listo!
             </Text>
           </View>
         </View>
@@ -374,6 +418,27 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 40,
     gap: 14,
+  },
+  errorCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+  },
+  errorRetryBtn: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: '#DC2626',
+    borderRadius: 8,
+  },
+  errorRetryText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
   },
   isolationNoticeCard: {
     padding: 14,
@@ -476,21 +541,42 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     fontFamily: 'monospace',
   },
+  commandSnippetSub: {
+    fontSize: 11,
+    marginTop: 4,
+    fontWeight: '500',
+  },
+  btnCol: {
+    width: '100%',
+    gap: 8,
+    marginBottom: 10,
+  },
   btnRow: {
     flexDirection: 'row',
     gap: 8,
     width: '100%',
-    marginBottom: 10,
   },
   actionBtn: {
-    flex: 1,
-    paddingVertical: 10,
+    width: '100%',
+    paddingVertical: 12,
     borderRadius: 10,
     alignItems: 'center',
   },
   actionBtnText: {
     color: '#FAF7F2',
-    fontSize: 12,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  subActionBtn: {
+    flex: 1,
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  subActionBtnText: {
+    fontSize: 11,
     fontWeight: '700',
   },
   shareBtn: {

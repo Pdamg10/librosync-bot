@@ -88,13 +88,50 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
         else:
-            await message.reply_text(
-                "ℹ️ Para vincular este chat con tu cuenta de LibroSync, envía:\n"
-                "<code>/start &lt;codigo_de_vinculacion&gt;</code>\n\n"
-                "(Obtén el código en tu app móvil LibroSync)",
-                parse_mode="HTML"
-            )
-        return
+            # En grupo/canal: vincular automáticamente a la cuenta principal del bot (user_id=1)
+            bot = context.bot
+            try:
+                status_info = await get_chat_and_bot_status(bot, chat.id)
+            except Exception as e:
+                await message.reply_text(f"❌ Error al consultar información del chat: {html.escape(str(e))}", parse_mode="HTML")
+                return
+
+            chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
+            async with AsyncSessionLocal() as session:
+                stmt_link = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+                res_link = await session.execute(stmt_link)
+                existing_link = res_link.scalar_one_or_none()
+
+                if existing_link:
+                    existing_link.user_id = 1
+                    existing_link.chat_type = chat_type_str
+                    existing_link.chat_title = status_info["chat_title"]
+                    existing_link.bot_is_admin = status_info["bot_is_admin"]
+                    existing_link.forum_enabled = status_info["forum_enabled"]
+                    existing_link.linked_at = datetime.now(timezone.utc)
+                else:
+                    new_link = TelegramLink(
+                        user_id=1,
+                        chat_id=chat.id,
+                        chat_type=chat_type_str,
+                        chat_title=status_info["chat_title"],
+                        bot_is_admin=status_info["bot_is_admin"],
+                        forum_enabled=status_info["forum_enabled"]
+                    )
+                    session.add(new_link)
+                await session.commit()
+
+            safe_title = html.escape(status_info["chat_title"])
+            msg_lines = [
+                f"🎉 <b>¡Grupo '{safe_title}' vinculado exitosamente a tu app Anaquel!</b>\n",
+                f"• <b>Tipo:</b> <code>{chat_type_str}</code>",
+                f"• <b>Temas (Topics):</b> {'✅ Activado' if status_info['forum_enabled'] else '❌ Desactivado'}",
+                f"• <b>Bot Administrador:</b> {'✅ Sí' if status_info['bot_is_admin'] else '❌ No'}",
+                f"• <b>Permiso 'Administrar temas':</b> {'✅ Sí' if status_info.get('can_manage_topics') else '❌ No'}\n",
+                "📚 Este grupo ya está enlazado con tu app móvil. Todos los libros organizados se sincronizan en tu biblioteca digital."
+            ]
+            await message.reply_text("\n".join(msg_lines), parse_mode="HTML")
+            return
 
     code_str = args[0].strip()
 
