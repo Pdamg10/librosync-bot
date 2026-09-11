@@ -8,14 +8,17 @@ import {
   SafeAreaView,
   Image,
   Alert,
+  TextInput,
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import {
   useAppTheme,
   PRESET_THEMES,
   PRESET_GRADIENTS,
-  PRESET_MEDIA_WALLPAPERS,
+  PRESET_WALLPAPERS,
+  COLOR_PALETTE_SWATCHES,
   BackgroundType,
+  isColorDark,
 } from '../theme/ThemeContext';
 
 interface CustomizeScreenProps {
@@ -28,33 +31,63 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
     theme,
     setSolidTheme,
     setGradientTheme,
+    addGradientColor,
+    removeGradientColor,
+    updateGradientColor,
     setMediaTheme,
     setMediaOverlayOpacity,
+    toggleContrastMode,
     resetToDefault,
   } = useAppTheme();
 
   const [activeTab, setActiveTab] = useState<BackgroundType>(theme.backgroundType);
   const [isPickingMedia, setIsPickingMedia] = useState<boolean>(false);
 
-  const handlePickLocalMedia = async () => {
+  // Hex libre para color sólido
+  const [customSolidHex, setCustomSolidHex] = useState<string>('#');
+  // Edición de color de stop en degradado
+  const [selectedGradientStopIndex, setSelectedGradientStopIndex] = useState<number | null>(null);
+
+  const handlePickLocalMedia = async (mediaKind: 'image' | 'gif' | 'video') => {
     try {
       setIsPickingMedia(true);
+      const mimeTypes =
+        mediaKind === 'video'
+          ? ['video/*']
+          : mediaKind === 'gif'
+          ? ['image/gif']
+          : ['image/*'];
+
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['image/*', 'video/*'],
+        type: mimeTypes,
         copyToCacheDirectory: true,
       });
 
       if (!result.canceled && result.assets && result.assets.length > 0) {
         const file = result.assets[0];
-        setMediaTheme(file.uri, file.name, theme.mediaOverlayOpacity, true);
-        setActiveTab('media');
-        Alert.alert('¡Fondo aplicado!', `Se ha establecido "${file.name}" como fondo de la aplicación.`);
+        setMediaTheme(file.uri, mediaKind, file.name, theme.mediaOverlayOpacity, true);
+        setActiveTab(mediaKind);
+        Alert.alert(
+          '¡Fondo personalizado aplicado!',
+          `Se ha establecido "${file.name}" como fondo de la aplicación. Puedes ajustar el contraste o velo protector abajo.`
+        );
       }
     } catch (err) {
       Alert.alert('Error', 'No se pudo seleccionar el archivo multimedia.');
     } finally {
       setIsPickingMedia(false);
     }
+  };
+
+  const handleApplyCustomSolidHex = () => {
+    let clean = customSolidHex.trim();
+    if (!clean.startsWith('#')) clean = `#${clean}`;
+    if (!/^#[0-9A-Fa-f]{6}$/.test(clean)) {
+      Alert.alert('Formato inválido', 'Por favor ingresa un color Hexadecimal válido (ej: #2A4365 o #F59E0B).');
+      return;
+    }
+    setSolidTheme(clean);
+    Alert.alert('Color aplicado', `Fondo sólido actualizado a ${clean}`);
   };
 
   const currentColors = theme.colors;
@@ -77,7 +110,7 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
               Personalización
             </Text>
             <Text style={[styles.headerSubtitle, { color: currentColors.textSecondary }]}>
-              Estilo, Fondos y Temas Visuales
+              Temas, Fondos y Contraste
             </Text>
           </View>
         </View>
@@ -93,37 +126,79 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
-        {/* Selector de Modo: Sólido / Degradado / Multimedia */}
-        <View style={[styles.modeTabs, { backgroundColor: currentColors.cardSecondaryBg }]}>
-          <TouchableOpacity
-            style={[styles.modeTab, activeTab === 'solid' && styles.modeTabActive]}
-            onPress={() => setActiveTab('solid')}
-          >
-            <Text style={[styles.modeTabText, activeTab === 'solid' && styles.modeTabTextActive]}>
-              🎨 Color Sólido
-            </Text>
-          </TouchableOpacity>
+        {/* Selector de Pestañas: Sólido / Degradado / Imagen / GIF / Video */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.modeTabsScroll}>
+          <View style={[styles.modeTabs, { backgroundColor: currentColors.cardSecondaryBg }]}>
+            <TouchableOpacity
+              style={[styles.modeTab, activeTab === 'solid' && [styles.modeTabActive, { backgroundColor: currentColors.accent }]]}
+              onPress={() => setActiveTab('solid')}
+            >
+              <Text style={[styles.modeTabText, { color: activeTab === 'solid' ? '#FFFFFF' : currentColors.textSecondary }]}>
+                🎨 Sólido
+              </Text>
+            </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.modeTab, activeTab === 'gradient' && styles.modeTabActive]}
-            onPress={() => setActiveTab('gradient')}
-          >
-            <Text style={[styles.modeTabText, activeTab === 'gradient' && styles.modeTabTextActive]}>
-              🌈 Degradado
-            </Text>
-          </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.modeTab, activeTab === 'gradient' && [styles.modeTabActive, { backgroundColor: currentColors.accent }]]}
+              onPress={() => setActiveTab('gradient')}
+            >
+              <Text style={[styles.modeTabText, { color: activeTab === 'gradient' ? '#FFFFFF' : currentColors.textSecondary }]}>
+                🌈 Degradado
+              </Text>
+            </TouchableOpacity>
 
+            <TouchableOpacity
+              style={[styles.modeTab, activeTab === 'image' && [styles.modeTabActive, { backgroundColor: currentColors.accent }]]}
+              onPress={() => setActiveTab('image')}
+            >
+              <Text style={[styles.modeTabText, { color: activeTab === 'image' ? '#FFFFFF' : currentColors.textSecondary }]}>
+                🖼️ Imagen
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.modeTab, activeTab === 'gif' && [styles.modeTabActive, { backgroundColor: currentColors.accent }]]}
+              onPress={() => setActiveTab('gif')}
+            >
+              <Text style={[styles.modeTabText, { color: activeTab === 'gif' ? '#FFFFFF' : currentColors.textSecondary }]}>
+                🎬 GIF
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.modeTab, activeTab === 'video' && [styles.modeTabActive, { backgroundColor: currentColors.accent }]]}
+              onPress={() => setActiveTab('video')}
+            >
+              <Text style={[styles.modeTabText, { color: activeTab === 'video' ? '#FFFFFF' : currentColors.textSecondary }]}>
+                🎥 Video
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+
+        {/* TARJETA DE CONTROL DE CONTRASTE Y LEGIBILIDAD (PUNTO CRÍTICO) */}
+        <View style={[styles.contrastCard, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}>
+          <View style={styles.contrastTextCol}>
+            <Text style={[styles.contrastCardTitle, { color: currentColors.textPrimary }]}>
+              Modo de Letras & Botones
+            </Text>
+            <Text style={[styles.contrastCardSubtitle, { color: currentColors.textSecondary }]}>
+              {theme.isDark
+                ? '⚪ Contraste Claro: Texto en blanco/marfil para fondos oscuros o fotos nocturnas.'
+                : '⚫ Contraste Oscuro: Texto en tinta negra/café para fondos claros o cremas.'}
+            </Text>
+          </View>
           <TouchableOpacity
-            style={[styles.modeTab, activeTab === 'media' && styles.modeTabActive]}
-            onPress={() => setActiveTab('media')}
+            style={[styles.contrastToggleBtn, { backgroundColor: currentColors.cardSecondaryBg, borderColor: currentColors.cardBorder }]}
+            onPress={toggleContrastMode}
           >
-            <Text style={[styles.modeTabText, activeTab === 'media' && styles.modeTabTextActive]}>
-              🖼️ Foto / GIF / Video
+            <Text style={[styles.contrastToggleBtnText, { color: currentColors.textPrimary }]}>
+              {theme.isDark ? '☀️ Pasar a Oscuro' : '🌙 Pasar a Claro'}
             </Text>
           </TouchableOpacity>
         </View>
 
-        {/* VISTA PREVIA EN TIEMPO REAL DEL LIBRO Y ESTANTE */}
+        {/* VISTA PREVIA EN VIVO */}
         <Text style={[styles.sectionTitle, { color: currentColors.textMuted }]}>
           VISTA PREVIA EN VIVO
         </Text>
@@ -136,7 +211,7 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
             },
           ]}
         >
-          {theme.backgroundType === 'media' && theme.mediaUri && (
+          {theme.mediaUri && (theme.backgroundType === 'image' || theme.backgroundType === 'gif') && (
             <Image
               source={{ uri: theme.mediaUri }}
               style={StyleSheet.absoluteFill}
@@ -144,10 +219,22 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
             />
           )}
 
+          {/* Velo protector en preview */}
+          {theme.mediaUri && (
+            <View
+              style={[
+                StyleSheet.absoluteFill,
+                {
+                  backgroundColor: theme.isDark ? '#000000' : '#FAF7F2',
+                  opacity: theme.mediaOverlayOpacity,
+                },
+              ]}
+            />
+          )}
+
           {/* Mini Estante y Libro 3D */}
           <View style={styles.previewBookContainer}>
             <View style={styles.previewHardcover}>
-              {/* Lomo 3D */}
               <View style={styles.previewSpineHighlight} />
               <View style={styles.previewSpineShadow} />
 
@@ -157,10 +244,7 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
                 <Text style={styles.previewBookAuthor}>Edición Especial</Text>
               </View>
 
-              {/* Cinta marcapáginas dorada */}
               <View style={styles.previewRibbon} />
-
-              {/* Bloque de páginas */}
               <View style={styles.previewPageBlock} />
             </View>
 
@@ -168,27 +252,80 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
             <View style={[styles.previewShelfBar, { backgroundColor: currentColors.shelfBar }]} />
             <View style={[styles.previewShelfEdge, { backgroundColor: currentColors.shelfBarEdge }]} />
 
-            {/* Título y autor debajo */}
-            <Text style={[styles.previewUnderTitle, { color: currentColors.textPrimary }]}>
-              Cien Años de Soledad
-            </Text>
-            <Text style={[styles.previewUnderAuthor, { color: currentColors.textSecondary }]}>
-              Gabriel García Márquez
-            </Text>
+            {/* Título y autor con colores adaptados */}
+            <View style={[styles.previewLabelBadge, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}>
+              <Text style={[styles.previewUnderTitle, { color: currentColors.textPrimary }]}>
+                Cien Años de Soledad
+              </Text>
+              <Text style={[styles.previewUnderAuthor, { color: currentColors.textSecondary }]}>
+                Gabriel García Márquez
+              </Text>
+            </View>
           </View>
 
           <Text style={[styles.previewCaption, { color: currentColors.textSecondary }]}>
-            {theme.backgroundType === 'solid' && `Color sólido activo`}
-            {theme.backgroundType === 'gradient' && `Degradado suave activo`}
-            {theme.backgroundType === 'media' && `Fondo multimedia: ${theme.mediaName || 'Personalizado'}`}
+            {theme.backgroundType === 'solid' && `Fondo sólido: ${theme.solidColor}`}
+            {theme.backgroundType === 'gradient' && `Degradado de ${theme.gradientColors.length} colores`}
+            {theme.backgroundType === 'image' && `Imagen: ${theme.mediaName || 'Personalizada'}`}
+            {theme.backgroundType === 'gif' && `GIF Animado: ${theme.mediaName || 'Personalizado'}`}
+            {theme.backgroundType === 'video' && `Video: ${theme.mediaName || 'Personalizado'}`}
           </Text>
         </View>
 
-        {/* CONTROLES DEL MODO 1: COLOR SÓLIDO */}
+        {/* PESTAÑA 1: COLOR SÓLIDO */}
         {activeTab === 'solid' && (
           <View style={styles.optionsBlock}>
+            {/* Paleta Libre / Custom Hex */}
+            <View style={[styles.customHexCard, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}>
+              <Text style={[styles.customHexTitle, { color: currentColors.textPrimary }]}>
+                🎯 Paleta Libre / Color Personalizado (Hex)
+              </Text>
+              <View style={styles.customHexRow}>
+                <TextInput
+                  style={[styles.customHexInput, { backgroundColor: currentColors.cardSecondaryBg, borderColor: currentColors.cardBorder, color: currentColors.textPrimary }]}
+                  placeholder="#EFE8DE o #181513"
+                  placeholderTextColor={currentColors.textMuted}
+                  value={customSolidHex}
+                  onChangeText={setCustomSolidHex}
+                  autoCapitalize="characters"
+                  maxLength={7}
+                />
+                <TouchableOpacity
+                  style={[styles.applyHexBtn, { backgroundColor: currentColors.accent }]}
+                  onPress={handleApplyCustomSolidHex}
+                >
+                  <Text style={styles.applyHexBtnText}>Aplicar</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Matriz de muestras de color */}
+              <Text style={[styles.swatchesSubtitle, { color: currentColors.textSecondary }]}>
+                Toca cualquier color de la muestra para aplicarlo al instante:
+              </Text>
+              <View style={styles.swatchesGrid}>
+                {COLOR_PALETTE_SWATCHES.map((hex) => {
+                  const isSelected = theme.backgroundType === 'solid' && theme.solidColor.toUpperCase() === hex.toUpperCase();
+                  return (
+                    <TouchableOpacity
+                      key={hex}
+                      style={[
+                        styles.swatchCircle,
+                        { backgroundColor: hex },
+                        isSelected && { borderColor: currentColors.accent, borderWidth: 3 },
+                      ]}
+                      onPress={() => {
+                        setCustomSolidHex(hex);
+                        setSolidTheme(hex);
+                      }}
+                    />
+                  );
+                })}
+              </View>
+            </View>
+
+            {/* Temas Predefinidos Completos */}
             <Text style={[styles.sectionTitle, { color: currentColors.textMuted }]}>
-              PALETAS DE COLOR SÓLIDO
+              TEMAS PREDEFINIDOS RECOMENDADOS
             </Text>
             {Object.entries(PRESET_THEMES).map(([key, t]) => {
               const isSelected = theme.backgroundType === 'solid' && theme.solidColor === t.hex;
@@ -227,17 +364,84 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
           </View>
         )}
 
-        {/* CONTROLES DEL MODO 2: DEGRADADOS */}
+        {/* PESTAÑA 2: DEGRADADOS MULTICOLOR */}
         {activeTab === 'gradient' && (
           <View style={styles.optionsBlock}>
+            {/* Editor interactivo de colores del degradado activo */}
+            <View style={[styles.gradientEditorCard, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}>
+              <Text style={[styles.gradientEditorTitle, { color: currentColors.textPrimary }]}>
+                🌈 Colores de este Degradado ({theme.gradientColors.length} colores)
+              </Text>
+              <Text style={[styles.gradientEditorDesc, { color: currentColors.textSecondary }]}>
+                Mínimo 2 colores. Puedes agregar más colores para crear transiciones únicas:
+              </Text>
+
+              {/* Lista de Stops */}
+              <View style={styles.stopsList}>
+                {theme.gradientColors.map((col, idx) => (
+                  <View key={idx} style={[styles.stopRow, { borderColor: currentColors.cardBorder }]}>
+                    <TouchableOpacity
+                      style={[styles.stopColorBtn, { backgroundColor: col }]}
+                      onPress={() => setSelectedGradientStopIndex(selectedGradientStopIndex === idx ? null : idx)}
+                    />
+                    <Text style={[styles.stopHexText, { color: currentColors.textPrimary }]}>
+                      Punto #{idx + 1}: <Text style={{ fontWeight: '700' }}>{col}</Text>
+                    </Text>
+
+                    {theme.gradientColors.length > 2 && (
+                      <TouchableOpacity
+                        style={styles.removeStopBtn}
+                        onPress={() => removeGradientColor(idx)}
+                      >
+                        <Text style={styles.removeStopBtnText}>✕ Eliminar</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                ))}
+              </View>
+
+              {/* Botón para añadir un nuevo color al degradado */}
+              <TouchableOpacity
+                style={[styles.addStopBtn, { backgroundColor: currentColors.accent }]}
+                onPress={() => {
+                  const sampleNewColors = ['#FCE7C3', '#C4D8BC', '#E7D8F2', '#38BDF8', '#F5BCAC'];
+                  const pick = sampleNewColors[theme.gradientColors.length % sampleNewColors.length];
+                  addGradientColor(pick);
+                }}
+              >
+                <Text style={styles.addStopBtnText}>+ Añadir Color al Degradado</Text>
+              </TouchableOpacity>
+
+              {/* Si hay un stop seleccionado, mostrar muestras para cambiarlo */}
+              {selectedGradientStopIndex !== null && (
+                <View style={[styles.editStopBox, { backgroundColor: currentColors.cardSecondaryBg }]}>
+                  <Text style={[styles.editStopTitle, { color: currentColors.textPrimary }]}>
+                    Selecciona nuevo color para Punto #{selectedGradientStopIndex + 1}:
+                  </Text>
+                  <View style={styles.swatchesGrid}>
+                    {COLOR_PALETTE_SWATCHES.map((sw) => (
+                      <TouchableOpacity
+                        key={sw}
+                        style={[styles.swatchCircleSmall, { backgroundColor: sw }]}
+                        onPress={() => {
+                          updateGradientColor(selectedGradientStopIndex, sw);
+                          setSelectedGradientStopIndex(null);
+                        }}
+                      />
+                    ))}
+                  </View>
+                </View>
+              )}
+            </View>
+
+            {/* Presets de degradados */}
             <Text style={[styles.sectionTitle, { color: currentColors.textMuted }]}>
-              DEGRADADOS SUAVES Y RELAJANTES
+              ESTILOS DE DEGRADADOS POPULARES
             </Text>
             {PRESET_GRADIENTS.map((g) => {
               const isSelected =
                 theme.backgroundType === 'gradient' &&
-                theme.gradientColors[0] === g.colors[0] &&
-                theme.gradientColors[1] === g.colors[1];
+                theme.gradientColors.join(',') === g.colors.join(',');
               return (
                 <TouchableOpacity
                   key={g.id}
@@ -249,15 +453,16 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
                   onPress={() => setGradientTheme(g.colors, g.isDark)}
                 >
                   <View style={styles.gradientPreviewBox}>
-                    <View style={{ flex: 1, backgroundColor: g.colors[0] }} />
-                    <View style={{ flex: 1, backgroundColor: g.colors[1] }} />
+                    {g.colors.map((c, i) => (
+                      <View key={i} style={{ flex: 1, backgroundColor: c }} />
+                    ))}
                   </View>
                   <View style={styles.optionRowTextCol}>
                     <Text style={[styles.optionRowTitle, { color: currentColors.textPrimary }]}>
                       {g.name}
                     </Text>
                     <Text style={[styles.optionRowSubtitle, { color: currentColors.textSecondary }]}>
-                      {g.isDark ? 'Gradiente Nocturno' : 'Gradiente Suave'}
+                      {g.colors.length} tonos • {g.isDark ? 'Nocturno' : 'Cálido y suave'}
                     </Text>
                   </View>
                   {isSelected && (
@@ -271,21 +476,20 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
           </View>
         )}
 
-        {/* CONTROLES DEL MODO 3: MULTIMEDIA (FOTO / GIF / VIDEO) */}
-        {activeTab === 'media' && (
+        {/* PESTAÑA 3: IMAGEN DE FONDO */}
+        {activeTab === 'image' && (
           <View style={styles.optionsBlock}>
-            {/* Botón para subir desde la galería del teléfono */}
             <TouchableOpacity
               style={[styles.uploadMediaCard, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}
-              onPress={handlePickLocalMedia}
+              onPress={() => handlePickLocalMedia('image')}
               disabled={isPickingMedia}
             >
-              <Text style={styles.uploadMediaIcon}>📂</Text>
+              <Text style={styles.uploadMediaIcon}>🖼️</Text>
               <Text style={[styles.uploadMediaTitle, { color: currentColors.textPrimary }]}>
-                {isPickingMedia ? 'Cargando archivo...' : 'Elegir Foto o GIF de tu Teléfono'}
+                {isPickingMedia ? 'Cargando imagen...' : 'Elegir Imagen de tu Teléfono'}
               </Text>
               <Text style={[styles.uploadMediaSubtitle, { color: currentColors.textSecondary }]}>
-                Selecciona cualquier imagen, fondo animado o captura de tu galería
+                Selecciona cualquier foto en alta resolución de tu galería
               </Text>
             </TouchableOpacity>
 
@@ -295,23 +499,23 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
             </Text>
             <View style={[styles.opacityRow, { backgroundColor: currentColors.cardSecondaryBg }]}>
               {[
-                { label: 'Suave (30%)', value: 0.3 },
-                { label: 'Medio (50%)', value: 0.5 },
-                { label: 'Oscuro (70%)', value: 0.7 },
-                { label: 'Noche (85%)', value: 0.85 },
+                { label: 'Suave (25%)', value: 0.25 },
+                { label: 'Medio (45%)', value: 0.45 },
+                { label: 'Oscuro (65%)', value: 0.65 },
+                { label: 'Noche (80%)', value: 0.8 },
               ].map((op) => (
                 <TouchableOpacity
                   key={op.label}
                   style={[
                     styles.opacityBtn,
-                    theme.mediaOverlayOpacity === op.value && styles.opacityBtnActive,
+                    theme.mediaOverlayOpacity === op.value && [styles.opacityBtnActive, { backgroundColor: currentColors.accent }],
                   ]}
                   onPress={() => setMediaOverlayOpacity(op.value)}
                 >
                   <Text
                     style={[
                       styles.opacityBtnText,
-                      theme.mediaOverlayOpacity === op.value && styles.opacityBtnTextActive,
+                      { color: theme.mediaOverlayOpacity === op.value ? '#FFFFFF' : currentColors.textSecondary },
                     ]}
                   >
                     {op.label}
@@ -320,13 +524,13 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
               ))}
             </View>
 
-            {/* Fondos Predefinidos de Calidad */}
+            {/* Muestras Predefinidas de Imágenes */}
             <Text style={[styles.sectionTitle, { color: currentColors.textMuted }]}>
               FONDOS DE BIBLIOTECA PREDEFINIDOS
             </Text>
             <View style={styles.wallpapersGrid}>
-              {PRESET_MEDIA_WALLPAPERS.map((w) => {
-                const isSelected = theme.backgroundType === 'media' && theme.mediaUri === w.uri;
+              {PRESET_WALLPAPERS.images.map((w) => {
+                const isSelected = theme.backgroundType === 'image' && theme.mediaUri === w.uri;
                 return (
                   <TouchableOpacity
                     key={w.id}
@@ -334,9 +538,111 @@ export function CustomizeScreen({ onOpenDrawer, onBack }: CustomizeScreenProps) 
                       styles.wallpaperItem,
                       isSelected && { borderColor: currentColors.accent, borderWidth: 3 },
                     ]}
-                    onPress={() => setMediaTheme(w.uri, w.name, theme.mediaOverlayOpacity, w.isDark)}
+                    onPress={() => setMediaTheme(w.uri, 'image', w.name, theme.mediaOverlayOpacity, w.isDark)}
                   >
                     <Image source={{ uri: w.uri }} style={styles.wallpaperThumb} />
+                    <View style={styles.wallpaperOverlay}>
+                      <Text style={styles.wallpaperName} numberOfLines={1}>
+                        {w.name}
+                      </Text>
+                    </View>
+                    {isSelected && (
+                      <View style={[styles.wallpaperBadge, { backgroundColor: currentColors.accent }]}>
+                        <Text style={styles.wallpaperBadgeText}>Activo</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        )}
+
+        {/* PESTAÑA 4: GIF ANIMADO */}
+        {activeTab === 'gif' && (
+          <View style={styles.optionsBlock}>
+            <TouchableOpacity
+              style={[styles.uploadMediaCard, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}
+              onPress={() => handlePickLocalMedia('gif')}
+              disabled={isPickingMedia}
+            >
+              <Text style={styles.uploadMediaIcon}>🎬</Text>
+              <Text style={[styles.uploadMediaTitle, { color: currentColors.textPrimary }]}>
+                {isPickingMedia ? 'Cargando GIF...' : 'Elegir GIF Animado de tu Teléfono'}
+              </Text>
+              <Text style={[styles.uploadMediaSubtitle, { color: currentColors.textSecondary }]}>
+                Fondos animados con movimiento en bucle continuo
+              </Text>
+            </TouchableOpacity>
+
+            <Text style={[styles.sectionTitle, { color: currentColors.textMuted }]}>
+              GIFS ACOGEDORES RECOMENDADOS
+            </Text>
+            <View style={styles.wallpapersGrid}>
+              {PRESET_WALLPAPERS.gifs.map((w) => {
+                const isSelected = theme.backgroundType === 'gif' && theme.mediaUri === w.uri;
+                return (
+                  <TouchableOpacity
+                    key={w.id}
+                    style={[
+                      styles.wallpaperItem,
+                      isSelected && { borderColor: currentColors.accent, borderWidth: 3 },
+                    ]}
+                    onPress={() => setMediaTheme(w.uri, 'gif', w.name, theme.mediaOverlayOpacity, w.isDark)}
+                  >
+                    <Image source={{ uri: w.uri }} style={styles.wallpaperThumb} />
+                    <View style={styles.wallpaperOverlay}>
+                      <Text style={styles.wallpaperName} numberOfLines={1}>
+                        {w.name}
+                      </Text>
+                    </View>
+                    {isSelected && (
+                      <View style={[styles.wallpaperBadge, { backgroundColor: currentColors.accent }]}>
+                        <Text style={styles.wallpaperBadgeText}>Activo</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        )}
+
+        {/* PESTAÑA 5: VIDEO DE FONDO */}
+        {activeTab === 'video' && (
+          <View style={styles.optionsBlock}>
+            <TouchableOpacity
+              style={[styles.uploadMediaCard, { backgroundColor: currentColors.cardBg, borderColor: currentColors.cardBorder }]}
+              onPress={() => handlePickLocalMedia('video')}
+              disabled={isPickingMedia}
+            >
+              <Text style={styles.uploadMediaIcon}>🎥</Text>
+              <Text style={[styles.uploadMediaTitle, { color: currentColors.textPrimary }]}>
+                {isPickingMedia ? 'Cargando video...' : 'Elegir Video (MP4) de tu Teléfono'}
+              </Text>
+              <Text style={[styles.uploadMediaSubtitle, { color: currentColors.textSecondary }]}>
+                Reproducción de video continuo en segundo plano silenciado
+              </Text>
+            </TouchableOpacity>
+
+            <Text style={[styles.sectionTitle, { color: currentColors.textMuted }]}>
+              VIDEOS ATMOSFÉRICOS DE LECTURA
+            </Text>
+            <View style={styles.wallpapersGrid}>
+              {PRESET_WALLPAPERS.videos.map((w) => {
+                const isSelected = theme.backgroundType === 'video' && theme.mediaUri === w.uri;
+                return (
+                  <TouchableOpacity
+                    key={w.id}
+                    style={[
+                      styles.wallpaperItem,
+                      isSelected && { borderColor: currentColors.accent, borderWidth: 3 },
+                    ]}
+                    onPress={() => setMediaTheme(w.uri, 'video', w.name, theme.mediaOverlayOpacity, w.isDark)}
+                  >
+                    <View style={[styles.wallpaperThumb, { backgroundColor: '#1A1412', alignItems: 'center', justifyContent: 'center' }]}>
+                      <Text style={{ fontSize: 32 }}>▶️</Text>
+                    </View>
                     <View style={styles.wallpaperOverlay}>
                       <Text style={styles.wallpaperName} numberOfLines={1}>
                         {w.name}
@@ -424,28 +730,56 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 40,
   },
+  modeTabsScroll: {
+    marginBottom: 14,
+  },
   modeTabs: {
     flexDirection: 'row',
     borderRadius: 12,
     padding: 4,
-    marginBottom: 18,
+    gap: 4,
   },
   modeTab: {
-    flex: 1,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     alignItems: 'center',
     borderRadius: 8,
   },
-  modeTabActive: {
-    backgroundColor: '#2C2523',
-  },
+  modeTabActive: {},
   modeTabText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#7A6E65',
+    fontSize: 12,
+    fontWeight: '700',
   },
-  modeTabTextActive: {
-    color: '#FAF7F2',
+  contrastCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    marginBottom: 14,
+  },
+  contrastTextCol: {
+    flex: 1,
+    marginRight: 10,
+  },
+  contrastCardTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+  contrastCardSubtitle: {
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  contrastToggleBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  contrastToggleBtnText: {
+    fontSize: 11,
     fontWeight: '700',
   },
   sectionTitle: {
@@ -550,10 +884,17 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: 2,
     borderBottomRightRadius: 2,
   },
+  previewLabelBadge: {
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
   previewUnderTitle: {
     fontSize: 12,
     fontWeight: '700',
-    marginTop: 6,
   },
   previewUnderAuthor: {
     fontSize: 10,
@@ -567,6 +908,66 @@ const styles = StyleSheet.create({
   },
   optionsBlock: {
     gap: 8,
+  },
+  customHexCard: {
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    marginBottom: 10,
+  },
+  customHexTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  customHexRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  customHexInput: {
+    flex: 1,
+    height: 40,
+    borderRadius: 8,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  applyHexBtn: {
+    paddingHorizontal: 16,
+    height: 40,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  applyHexBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  swatchesSubtitle: {
+    fontSize: 11,
+    marginBottom: 8,
+  },
+  swatchesGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  swatchCircle: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: 'rgba(0, 0, 0, 0.15)',
+  },
+  swatchCircleSmall: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.15)',
   },
   optionRow: {
     flexDirection: 'row',
@@ -614,6 +1015,76 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     color: '#FAF7F2',
   },
+  gradientEditorCard: {
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    marginBottom: 10,
+  },
+  gradientEditorTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  gradientEditorDesc: {
+    fontSize: 11,
+    lineHeight: 15,
+    marginBottom: 10,
+  },
+  stopsList: {
+    gap: 6,
+    marginBottom: 10,
+  },
+  stopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 10,
+  },
+  stopColorBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.2)',
+  },
+  stopHexText: {
+    flex: 1,
+    fontSize: 12,
+  },
+  removeStopBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#FEE2E2',
+  },
+  removeStopBtnText: {
+    fontSize: 10,
+    color: '#DC2626',
+    fontWeight: '700',
+  },
+  addStopBtn: {
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  addStopBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  editStopBox: {
+    marginTop: 10,
+    padding: 10,
+    borderRadius: 10,
+  },
+  editStopTitle: {
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
   uploadMediaCard: {
     padding: 16,
     borderRadius: 14,
@@ -646,17 +1117,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 8,
   },
-  opacityBtnActive: {
-    backgroundColor: '#2C2523',
-  },
+  opacityBtnActive: {},
   opacityBtnText: {
     fontSize: 10,
     fontWeight: '600',
-    color: '#7A6E65',
-  },
-  opacityBtnTextActive: {
-    color: '#FAF7F2',
-    fontWeight: '700',
   },
   wallpapersGrid: {
     flexDirection: 'row',

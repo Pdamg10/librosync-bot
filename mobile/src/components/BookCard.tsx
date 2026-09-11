@@ -9,6 +9,7 @@ import {
 import Svg, { Path } from 'react-native-svg';
 import { Book } from '../types';
 import { colors, getGenreEmoji, getBookPalette } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 
 interface BookCardProps {
   book: Book;
@@ -23,6 +24,8 @@ export const BookCard: React.FC<BookCardProps> = ({
   onLongPress,
   width,
 }) => {
+  const { theme } = useAppTheme();
+  const c = theme.colors;
   const emoji = getGenreEmoji(book.genre);
   const palette = getBookPalette(book.genre);
   const progressPercent = Math.min(100, Math.max(0, Math.round(book.reading_progress || 0)));
@@ -103,17 +106,17 @@ export const BookCard: React.FC<BookCardProps> = ({
 
       {/* ================= REPISA / ESTANTERÍA DE MADERA ================= */}
       <View style={styles.shelfContainer}>
-        <View style={styles.shelfTopSurface} />
-        <View style={styles.shelfFrontBevel} />
+        <View style={[styles.shelfTopSurface, { backgroundColor: c.shelfBar }]} />
+        <View style={[styles.shelfFrontBevel, { backgroundColor: c.shelfBarEdge }]} />
         <View style={styles.shelfBottomShadow} />
       </View>
 
-      {/* ================= METADATOS: TÍTULO Y AUTOR ================= */}
-      <View style={styles.metaContainer}>
-        <Text style={styles.bookTitle} numberOfLines={2}>
+      {/* ================= METADATOS: TÍTULO Y AUTOR CON FONDO PROTEGIDO ================= */}
+      <View style={[styles.metaContainer, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
+        <Text style={[styles.bookTitle, { color: c.textPrimary }]} numberOfLines={2}>
           {book.title}
         </Text>
-        <Text style={styles.bookAuthor} numberOfLines={1}>
+        <Text style={[styles.bookAuthor, { color: c.textSecondary }]} numberOfLines={1}>
           {book.author || 'Desconocido'}
         </Text>
       </View>
@@ -328,24 +331,30 @@ const styles = StyleSheet.create({
     borderBottomRightRadius: 3,
   },
 
-  /* Metadata Under Book */
+  /* Metadata Under Book with high-contrast card backing */
   metaContainer: {
-    width: '100%',
+    width: '92%',
     marginTop: 8,
     alignItems: 'center',
-    paddingHorizontal: 4,
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 2,
+    elevation: 1,
   },
   bookTitle: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '700',
-    color: '#2C221E',
     textAlign: 'center',
-    lineHeight: 17,
+    lineHeight: 16,
   },
   bookAuthor: {
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '500',
-    color: '#7A6E65',
     textAlign: 'center',
     marginTop: 2,
   },

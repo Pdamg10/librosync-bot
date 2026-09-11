@@ -1,7 +1,7 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from app.core.database import get_db
 from app.models.telegram_link import TelegramLink
@@ -10,10 +10,12 @@ from app.schemas.telegram import TelegramLinkOut
 router = APIRouter(prefix="/telegram", tags=["Telegram Links"])
 
 @router.get("/links", response_model=List[TelegramLinkOut])
-async def get_user_links(user_id: int, db: AsyncSession = Depends(get_db)):
-    """Obtiene todos los chats de Telegram vinculados a la cuenta de un usuario."""
-    stmt = select(TelegramLink).where(TelegramLink.user_id == user_id)
-    res = await db.execute(stmt)
+async def get_user_links(user_id: Optional[int] = Query(None), db: AsyncSession = Depends(get_db)):
+    """Obtiene los chats de Telegram vinculados a la cuenta del usuario o comunidad."""
+    stmt = select(TelegramLink)
+    if user_id:
+        stmt = stmt.where(or_(TelegramLink.user_id == user_id, TelegramLink.user_id == 1))
+    res = await db.execute(stmt.order_by(TelegramLink.id.asc()))
     return res.scalars().all()
 
 @router.delete("/links/{link_id}")

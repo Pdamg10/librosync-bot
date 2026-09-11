@@ -9,10 +9,12 @@ import {
   KeyboardAvoidingView,
   Platform,
   SafeAreaView,
-  Image,
+  ActivityIndicator,
 } from 'react-native';
 import { Book, ShelfSummary } from '../types';
 import { useAppTheme } from '../theme/ThemeContext';
+import { askGriffinAi, getCurrentUserId, updateReadingProgress } from '../services/api';
+import { ReaderModal } from '../components/ReaderModal';
 
 interface ChatMessage {
   id: string;
@@ -39,11 +41,14 @@ export function ChatScreen({
   const c = theme.colors;
 
   const [inputText, setInputText] = useState('');
+  const [isTyping, setIsTyping] = useState<boolean>(false);
+  const [selectedBookForReader, setSelectedBookForReader] = useState<Book | null>(null);
+
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'm-1',
       sender: 'assistant',
-      text: '👋 ¡Hola! Soy Griffin, tu bibliotecario inteligente. ¿Qué te gustaría leer hoy o en qué puedo orientarte sobre tu biblioteca?',
+      text: '🦉 ¡Hola! Soy Griffin, tu bibliotecario inteligente. ¿Qué te gustaría leer hoy o en qué puedo orientarte sobre tu biblioteca?',
       timestamp: 'Ahora',
       recommendedBooks: catalogBooks.slice(0, 3),
     },
@@ -52,13 +57,16 @@ export function ChatScreen({
   const flatListRef = useRef<FlatList>(null);
 
   useEffect(() => {
-    // Si la lista de libros cambia y es el mensaje inicial, actualizamos las recomendaciones
-    if (catalogBooks.length > 0 && messages.length === 1 && (!messages[0].recommendedBooks || messages[0].recommendedBooks.length === 0)) {
+    if (
+      catalogBooks.length > 0 &&
+      messages.length === 1 &&
+      (!messages[0].recommendedBooks || messages[0].recommendedBooks.length === 0)
+    ) {
       setMessages([
         {
           id: 'm-1',
           sender: 'assistant',
-          text: '👋 ¡Hola! Soy Griffin, tu bibliotecario inteligente. ¿Qué te gustaría leer hoy o en qué puedo orientarte sobre tu biblioteca?',
+          text: '🦉 ¡Hola! Soy Griffin, tu bibliotecario inteligente. ¿Qué te gustaría leer hoy o en qué puedo orientarte sobre tu biblioteca?',
           timestamp: 'Ahora',
           recommendedBooks: catalogBooks.slice(0, 3),
         },
@@ -66,9 +74,9 @@ export function ChatScreen({
     }
   }, [catalogBooks]);
 
-  const handleSend = (textToSend?: string) => {
+  const handleSend = async (textToSend?: string) => {
     const query = (textToSend || inputText).trim();
-    if (!query) return;
+    if (!query || isTyping) return;
 
     const userMsg: ChatMessage = {
       id: String(Date.now()),
@@ -79,64 +87,38 @@ export function ChatScreen({
 
     setMessages((prev) => [...prev, userMsg]);
     setInputText('');
+    setIsTyping(true);
 
-    // Respuesta inteligente de Griffin
-    setTimeout(() => {
-      generateGriffinReply(query);
-    }, 600);
-  };
+    try {
+      const response = await askGriffinAi(query, getCurrentUserId());
+      const cleanReply = (response.reply || '')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<b>(.*?)<\/b>/gi, '$1')
+        .replace(/<i>(.*?)<\/i>/gi, '$1');
 
-  const generateGriffinReply = (query: string) => {
-    const q = query.toLowerCase();
-    let replyText = '';
-    let recs: Book[] = [];
-
-    if (q.includes('progreso') || q.includes('leyendo') || q.includes('avance')) {
-      const reading = shelves?.reading || [];
-      if (reading.length === 0) {
-        replyText = 'Actualmente no tienes libros en curso. ¡Explora el catálogo general o marca uno para comenzar!';
-      } else {
-        const details = reading
-          .map((r) => `• "${r.book?.title}": ${Math.round(r.progress_percent)}% completado`)
-          .join('\n');
-        replyText = `📊 Este es tu estado de lectura actual:\n\n${details}\n\n¿Quieres continuar la lectura de alguno de ellos?`;
-        recs = reading.map((r) => r.book!).filter(Boolean);
-      }
-    } else if (q.includes('recomiend') || q.includes('popular') || q.includes('suger')) {
-      replyText = 'Aquí tienes algunas de las lecturas más populares y comentadas en nuestro club:';
-      recs = catalogBooks.slice(0, 3);
-    } else if (q.includes('terminad') || q.includes('completad') || q.includes('leído')) {
-      const finished = shelves?.finished || [];
-      replyText = `Has completado ${finished.length} libro(s) con éxito. 🏆 ¡Excelente hábito de lectura!`;
-    } else if (q.includes('fantasia') || q.includes('fantasía') || q.includes('novela') || q.includes('terror') || q.includes('misterio')) {
-      const matched = catalogBooks.filter(
-        (b) =>
-          b.genre.toLowerCase().includes(q) ||
-          b.title.toLowerCase().includes(q)
-      );
-      if (matched.length > 0) {
-        replyText = `He encontrado estas opciones relacionadas en el archivo del club:`;
-        recs = matched.slice(0, 3);
-      } else {
-        replyText = `No encontré coincidencias exactas para ese género, pero aquí tienes otros títulos recomendados:`;
-        recs = catalogBooks.slice(0, 2);
-      }
-    } else {
-      replyText = `He tomado nota de tu consulta sobre "${query}". Puedes pedirme recomendaciones de libros, consultar tu progreso o pedir detalles de cualquier autor.`;
-      if (catalogBooks.length > 0) {
-        recs = [catalogBooks[Math.floor(Math.random() * catalogBooks.length)]];
-      }
+      const assistantMsg: ChatMessage = {
+        id: String(Date.now() + 1),
+        sender: 'assistant',
+        text: cleanReply,
+        timestamp: 'Ahora',
+        recommendedBooks:
+          response.recommended_books && response.recommended_books.length > 0
+            ? response.recommended_books
+            : undefined,
+      };
+      setMessages((prev) => [...prev, assistantMsg]);
+    } catch (err: any) {
+      // Mensaje de fallback si no hay respuesta de red
+      const assistantMsg: ChatMessage = {
+        id: String(Date.now() + 1),
+        sender: 'assistant',
+        text: '📖 No he podido conectar con el servicio de IA en este momento. Revisa tu conexión de red o verifica los ajustes de la biblioteca.',
+        timestamp: 'Ahora',
+      };
+      setMessages((prev) => [...prev, assistantMsg]);
+    } finally {
+      setIsTyping(false);
     }
-
-    const assistantMsg: ChatMessage = {
-      id: String(Date.now() + 1),
-      sender: 'assistant',
-      text: replyText,
-      timestamp: 'Ahora',
-      recommendedBooks: recs.length > 0 ? recs : undefined,
-    };
-
-    setMessages((prev) => [...prev, assistantMsg]);
   };
 
   const renderItem = ({ item }: { item: ChatMessage }) => {
@@ -145,37 +127,61 @@ export function ChatScreen({
     return (
       <View style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAssistant]}>
         {!isUser && (
-          <View style={styles.assistantAvatar}>
+          <View style={[styles.assistantAvatar, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
             <Text style={styles.assistantAvatarText}>🦉</Text>
           </View>
         )}
 
-        <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAssistant]}>
-          <Text style={[styles.bubbleText, isUser ? styles.bubbleTextUser : styles.bubbleTextAssistant]}>
+        <View
+          style={[
+            styles.bubble,
+            isUser
+              ? [styles.bubbleUser, { backgroundColor: c.accent }]
+              : [styles.bubbleAssistant, { backgroundColor: c.cardBg, borderColor: c.cardBorder }],
+          ]}
+        >
+          <Text
+            style={[
+              styles.bubbleText,
+              isUser ? styles.bubbleTextUser : [styles.bubbleTextAssistant, { color: c.textPrimary }],
+            ]}
+          >
             {item.text}
           </Text>
 
-          {/* Tarjetas de libros recomendados dentro del mensaje (como en la imagen de referencia) */}
+          {/* Tarjetas de libros recomendados por Griffin */}
           {item.recommendedBooks && item.recommendedBooks.length > 0 && (
             <View style={styles.recBooksContainer}>
               {item.recommendedBooks.map((book) => (
                 <TouchableOpacity
                   key={book.id}
-                  style={styles.recBookMiniCard}
-                  onPress={() => onSelectBook && onSelectBook(book)}
+                  style={[styles.recBookMiniCard, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}
+                  onPress={() => {
+                    if (onSelectBook) onSelectBook(book);
+                    else setSelectedBookForReader(book);
+                  }}
                 >
-                  <View style={styles.recBookSpineHighlight} />
-                  <Text style={styles.recBookTitle} numberOfLines={1}>{book.title}</Text>
-                  <Text style={styles.recBookAuthor} numberOfLines={1}>{book.author || 'Autor'}</Text>
+                  <View style={[styles.recBookSpineHighlight, { backgroundColor: c.accent }]} />
+                  <Text style={[styles.recBookTitle, { color: c.textPrimary }]} numberOfLines={1}>
+                    {book.title}
+                  </Text>
+                  <Text style={[styles.recBookAuthor, { color: c.textSecondary }]} numberOfLines={1}>
+                    {book.author || 'Autor'} • {book.genre}
+                  </Text>
                   <View style={styles.recBookActionRow}>
-                    <Text style={styles.recBookActionText}>Abrir libro →</Text>
+                    <Text style={[styles.recBookActionText, { color: c.accent }]}>📖 Abrir libro →</Text>
                   </View>
                 </TouchableOpacity>
               ))}
             </View>
           )}
 
-          <Text style={[styles.bubbleTimestamp, isUser ? styles.timestampUser : styles.timestampAssistant]}>
+          <Text
+            style={[
+              styles.bubbleTimestamp,
+              isUser ? styles.timestampUser : [styles.timestampAssistant, { color: c.textMuted }],
+            ]}
+          >
             {item.timestamp}
           </Text>
         </View>
@@ -189,52 +195,58 @@ export function ChatScreen({
       <View style={[styles.header, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
         <View style={styles.headerLeft}>
           {onOpenDrawer && (
-            <TouchableOpacity onPress={onOpenDrawer} style={[styles.menuBtn, { backgroundColor: c.cardSecondaryBg }]}>
+            <TouchableOpacity
+              onPress={onOpenDrawer}
+              style={[styles.menuBtn, { backgroundColor: c.cardSecondaryBg }]}
+            >
               <Text style={[styles.menuIcon, { color: c.textPrimary }]}>☰</Text>
             </TouchableOpacity>
           )}
           <View>
-            <Text style={[styles.headerTitle, { color: c.textPrimary }]}>Chat con Griffin</Text>
-            <Text style={styles.headerSubtitle}>Bibliotecario IA • En línea</Text>
+            <Text style={[styles.headerTitle, { color: c.textPrimary }]}>Griffin IA</Text>
+            <Text style={styles.headerSubtitle}>Bibliotecario Inteligente • En línea</Text>
           </View>
         </View>
         <View style={styles.headerStatusDot} />
       </View>
 
-      {/* Banner de Asistencia y Soporte Inmediato (Estilo Imagen de Referencia) */}
+      {/* Banner de Asistencia Inmediata */}
       <View style={[styles.supportBanner, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
         <View style={styles.supportBannerTextCol}>
-          <Text style={[styles.supportBannerTitle, { color: c.textPrimary }]}>Asistencia del Club</Text>
+          <Text style={[styles.supportBannerTitle, { color: c.textPrimary }]}>Asistencia en Tiempo Real</Text>
           <Text style={[styles.supportBannerSubtitle, { color: c.textSecondary }]}>
-            Recomendaciones y consultas sobre el catálogo
+            Conectado con Gemini y la base de datos de tu biblioteca
           </Text>
         </View>
         <View style={[styles.supportBannerArrowCircle, { backgroundColor: c.cardSecondaryBg }]}>
-          <Text style={[styles.supportBannerArrow, { color: c.textSecondary }]}>›</Text>
+          <Text style={[styles.supportBannerArrow, { color: c.textSecondary }]}>✨</Text>
         </View>
       </View>
 
-      {/* Sugerencias Rápidas / Pills */}
+      {/* Sugerencias Rápidas Dinámicas */}
       <View style={styles.quickPromptsRow}>
         <TouchableOpacity
           style={[styles.promptPill, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
-          onPress={() => handleSend('¿Cuál es mi progreso de lectura?')}
+          onPress={() => handleSend('¿Cuál es mi progreso de lectura actual?')}
+          disabled={isTyping}
         >
-          <Text style={[styles.promptPillText, { color: c.textSecondary }]}>📊 Mi progreso</Text>
+          <Text style={[styles.promptPillText, { color: c.textPrimary }]}>📊 Mi progreso</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.promptPill, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
-          onPress={() => handleSend('Recomiéndame un buen libro')}
+          onPress={() => handleSend('Recomiéndame una buena lectura de la biblioteca')}
+          disabled={isTyping}
         >
-          <Text style={[styles.promptPillText, { color: c.textSecondary }]}>✨ Recomiéndame</Text>
+          <Text style={[styles.promptPillText, { color: c.textPrimary }]}>✨ Recomiéndame</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.promptPill, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
-          onPress={() => handleSend('¿Qué libros hay en la biblioteca?')}
+          onPress={() => handleSend('¿Cuáles son las últimas novedades de la biblioteca?')}
+          disabled={isTyping}
         >
-          <Text style={[styles.promptPillText, { color: c.textSecondary }]}>📚 Ver novedades</Text>
+          <Text style={[styles.promptPillText, { color: c.textPrimary }]}>🆕 Ver novedades</Text>
         </TouchableOpacity>
       </View>
 
@@ -250,36 +262,63 @@ export function ChatScreen({
           renderItem={renderItem}
           contentContainerStyle={styles.messagesList}
           onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+          ListFooterComponent={
+            isTyping ? (
+              <View style={styles.typingIndicatorRow}>
+                <View style={[styles.assistantAvatar, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
+                  <Text style={styles.assistantAvatarText}>🦉</Text>
+                </View>
+                <View style={[styles.typingBubble, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
+                  <ActivityIndicator size="small" color={c.accent} style={{ marginRight: 8 }} />
+                  <Text style={[styles.typingText, { color: c.textSecondary }]}>
+                    Griffin está consultando los estantes...
+                  </Text>
+                </View>
+              </View>
+            ) : null
+          }
         />
 
-        {/* Barra de Entrada Inferior (Estilo Imagen de Referencia) */}
+        {/* Barra de Entrada Inferior */}
         <View style={[styles.inputContainer, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
-          <TouchableOpacity
-            style={[styles.attachBtn, { backgroundColor: c.cardSecondaryBg }]}
-            onPress={() => alert('Adjuntar notas o pasajes favoritos')}
-          >
-            <Text style={[styles.attachBtnIcon, { color: c.textSecondary }]}>📎</Text>
-          </TouchableOpacity>
-
           <TextInput
-            style={[styles.input, { backgroundColor: c.cardSecondaryBg, color: c.textPrimary }]}
-            placeholder="Escribe un mensaje a Griffin..."
+            style={[styles.input, { backgroundColor: c.cardSecondaryBg, color: c.textPrimary, borderColor: c.cardBorder }]}
+            placeholder="Pregúntale a Griffin sobre libros o progreso..."
             placeholderTextColor={c.textMuted}
             value={inputText}
             onChangeText={setInputText}
             onSubmitEditing={() => handleSend()}
             returnKeyType="send"
+            editable={!isTyping}
           />
 
           <TouchableOpacity
-            style={[styles.sendBtn, !inputText.trim() && styles.sendBtnDisabled]}
+            style={[
+              styles.sendBtn,
+              { backgroundColor: c.accent },
+              (!inputText.trim() || isTyping) && styles.sendBtnDisabled,
+            ]}
             onPress={() => handleSend()}
-            disabled={!inputText.trim()}
+            disabled={!inputText.trim() || isTyping}
           >
-            <Text style={styles.sendBtnIcon}>➤</Text>
+            {isTyping ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <Text style={styles.sendBtnIcon}>➤</Text>
+            )}
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+
+      {/* Lector Integrado al tocar una recomendación */}
+      <ReaderModal
+        visible={selectedBookForReader !== null}
+        book={selectedBookForReader}
+        onClose={() => setSelectedBookForReader(null)}
+        onProgressUpdated={(bookId, progress) => {
+          updateReadingProgress(bookId, progress).catch(() => {});
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -287,17 +326,14 @@ export function ChatScreen({
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: 'transparent',
   },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
+    paddingHorizontal: 18,
     paddingVertical: 14,
-    backgroundColor: '#FBF8F3',
     borderBottomWidth: 1,
-    borderBottomColor: '#DFD5C6',
   },
   headerLeft: {
     flexDirection: 'row',
@@ -308,22 +344,20 @@ const styles = StyleSheet.create({
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: '#EDE5D8',
     alignItems: 'center',
     justifyContent: 'center',
   },
   menuIcon: {
     fontSize: 18,
-    color: '#2C221E',
+    fontWeight: '700',
   },
   headerTitle: {
     fontSize: 17,
     fontWeight: '700',
-    color: '#2C221E',
   },
   headerSubtitle: {
     fontSize: 12,
-    color: '#059669',
+    color: '#10B981',
     fontWeight: '600',
   },
   headerStatusDot: {
@@ -336,14 +370,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: '#FBF8F3',
     marginHorizontal: 16,
     marginTop: 12,
     marginBottom: 8,
     padding: 14,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#DFD5C6',
   },
   supportBannerTextCol: {
     flex: 1,
@@ -351,26 +383,21 @@ const styles = StyleSheet.create({
   supportBannerTitle: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#2C221E',
   },
   supportBannerSubtitle: {
     fontSize: 11,
-    color: '#7A6E65',
     marginTop: 2,
   },
   supportBannerArrowCircle: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: '#EDE5D8',
+    width: 30,
+    height: 30,
+    borderRadius: 15,
     alignItems: 'center',
     justifyContent: 'center',
     marginLeft: 8,
   },
   supportBannerArrow: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#7A6E65',
+    fontSize: 15,
   },
   quickPromptsRow: {
     flexDirection: 'row',
@@ -379,17 +406,14 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   promptPill: {
-    backgroundColor: '#FBF8F3',
     paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingVertical: 7,
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: '#DFD5C6',
   },
   promptPillText: {
     fontSize: 12,
-    fontWeight: '600',
-    color: '#7A6E65',
+    fontWeight: '700',
   },
   messagesList: {
     paddingHorizontal: 16,
@@ -411,9 +435,7 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: '#EDE5D8',
     borderWidth: 1,
-    borderColor: '#DFD5C6',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 8,
@@ -423,57 +445,67 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   bubble: {
-    maxWidth: '80%',
+    maxWidth: '82%',
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 18,
-    shadowColor: '#2C221E',
+    shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.04,
+    shadowOpacity: 0.05,
     shadowRadius: 3,
     elevation: 1,
   },
   bubbleUser: {
-    backgroundColor: '#8E75B2',
     borderBottomRightRadius: 4,
   },
   bubbleAssistant: {
-    backgroundColor: '#FBF8F3',
     borderWidth: 1,
-    borderColor: '#DFD5C6',
     borderBottomLeftRadius: 4,
   },
   bubbleText: {
     fontSize: 14,
-    lineHeight: 20,
+    lineHeight: 21,
   },
   bubbleTextUser: {
     color: '#FFFFFF',
+    fontWeight: '500',
   },
-  bubbleTextAssistant: {
-    color: '#2C221E',
-  },
+  bubbleTextAssistant: {},
   bubbleTimestamp: {
     fontSize: 10,
-    marginTop: 4,
+    marginTop: 5,
     alignSelf: 'flex-end',
   },
   timestampUser: {
-    color: 'rgba(255, 255, 255, 0.7)',
+    color: 'rgba(255, 255, 255, 0.75)',
   },
-  timestampAssistant: {
-    color: '#9C8E82',
+  timestampAssistant: {},
+  typingIndicatorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 4,
+    marginBottom: 8,
+  },
+  typingBubble: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 16,
+    borderWidth: 1,
+  },
+  typingText: {
+    fontSize: 12,
+    fontStyle: 'italic',
   },
   recBooksContainer: {
     marginTop: 10,
     gap: 6,
   },
   recBookMiniCard: {
-    backgroundColor: '#F3EDE2',
     padding: 8,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#DFD5C6',
     position: 'relative',
     overflow: 'hidden',
   },
@@ -483,17 +515,14 @@ const styles = StyleSheet.create({
     top: 0,
     bottom: 0,
     width: 4,
-    backgroundColor: '#D97706',
   },
   recBookTitle: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#2C221E',
     marginLeft: 4,
   },
   recBookAuthor: {
     fontSize: 11,
-    color: '#7A6E65',
     marginLeft: 4,
     marginBottom: 4,
   },
@@ -503,49 +532,32 @@ const styles = StyleSheet.create({
   recBookActionText: {
     fontSize: 10,
     fontWeight: '700',
-    color: '#B45309',
   },
   inputContainer: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 12,
     paddingVertical: 8,
-    backgroundColor: '#FBF8F3',
     borderTopWidth: 1,
-    borderTopColor: '#DFD5C6',
     gap: 8,
-  },
-  attachBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#EDE5D8',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  attachBtnIcon: {
-    fontSize: 18,
-    color: '#7A6E65',
   },
   input: {
     flex: 1,
-    height: 40,
-    backgroundColor: '#EDE5D8',
-    borderRadius: 20,
+    height: 42,
+    borderRadius: 21,
     paddingHorizontal: 16,
     fontSize: 14,
-    color: '#2C221E',
+    borderWidth: 1,
   },
   sendBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#E06D53',
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     alignItems: 'center',
     justifyContent: 'center',
   },
   sendBtnDisabled: {
-    backgroundColor: '#D5CCC0',
+    opacity: 0.45,
   },
   sendBtnIcon: {
     fontSize: 16,

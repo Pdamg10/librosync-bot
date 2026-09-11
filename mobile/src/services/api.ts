@@ -1,14 +1,30 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import { Book, TelegramLink, LinkCodeResponse, ReadingState, ShelfSummary, BuddyRead, BuddyReadMember } from '../types';
 
+const STORAGE_KEY_BASE_URL = '@bookapp_api_base_url';
 
-// Default host: en emulador Android es 10.0.2.2, en web/iOS es localhost
-let BASE_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
+// Default host: En red local Wi-Fi para teléfonos físicos usamos la IP de la máquina host
+export const DEFAULT_HOST_URL = 'http://10.46.1.120:8000';
+export const FALLBACK_URLS = [
+  'http://10.46.1.120:8000',
+  'http://10.0.2.2:8000',
+  'http://localhost:8000',
+];
+
+let BASE_URL = DEFAULT_HOST_URL;
 let CURRENT_USER_ID = 1;
 
+// Cargar URL persistida al iniciar
+AsyncStorage.getItem(STORAGE_KEY_BASE_URL).then((savedUrl) => {
+  if (savedUrl) {
+    BASE_URL = savedUrl.replace(/\/+$/, '');
+  }
+}).catch(() => {});
+
 export function setApiBaseUrl(url: string) {
-  // Limpiar trailing slash
   BASE_URL = url.replace(/\/+$/, '');
+  AsyncStorage.setItem(STORAGE_KEY_BASE_URL, BASE_URL).catch(() => {});
 }
 
 export function getApiBaseUrl(): string {
@@ -23,9 +39,16 @@ export function setCurrentUserId(id: number) {
   CURRENT_USER_ID = id;
 }
 
-export async function checkServerHealth(): Promise<boolean> {
+export async function checkServerHealth(targetUrl?: string): Promise<boolean> {
+  const urlToCheck = targetUrl ? targetUrl.replace(/\/+$/, '') : BASE_URL;
   try {
-    const res = await fetch(`${BASE_URL}/health`, { method: 'GET' });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(`${urlToCheck}/health`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
     if (!res.ok) return false;
     const data = await res.json();
     return data.status === 'healthy';
@@ -33,6 +56,21 @@ export async function checkServerHealth(): Promise<boolean> {
     return false;
   }
 }
+
+export async function autoDiscoverServer(): Promise<string | null> {
+  // Probar la URL actual primero
+  if (await checkServerHealth(BASE_URL)) return BASE_URL;
+
+  // Probar candidatos
+  for (const candidate of FALLBACK_URLS) {
+    if (candidate !== BASE_URL && await checkServerHealth(candidate)) {
+      setApiBaseUrl(candidate);
+      return candidate;
+    }
+  }
+  return null;
+}
+
 
 export async function fetchBooks(genre?: string, search?: string, telegramLinkId?: number): Promise<Book[]> {
   const params = new URLSearchParams();
@@ -253,4 +291,46 @@ export async function fetchCoReaders(bookId: number, excludeUserId?: number): Pr
   }
   return await res.json();
 }
+
+export async function askGriffinAi(
+  message: string,
+  userId: number = CURRENT_USER_ID,
+  telegramLinkId?: number
+): Promise<{ reply: string; recommended_books: Book[] }> {
+  const res = await fetch(`${BASE_URL}/library/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message,
+      user_id: userId,
+      telegram_link_id: telegramLinkId,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Error ${res.status} al consultar Griffin IA`);
+  }
+  return await res.json();
+}
+
+export async function syncTelegramLibrary(telegramLinkId?: number): Promise<{
+  status: string;
+  purged_books: number;
+  duplicates_removed: number;
+  active_books: number;
+  active_topics: number;
+  message?: string;
+}> {
+  const url = telegramLinkId
+    ? `${BASE_URL}/library/sync?telegram_link_id=${telegramLinkId}`
+    : `${BASE_URL}/library/sync`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    throw new Error(`Error ${res.status} al sincronizar biblioteca`);
+  }
+  return await res.json();
+}
+
 

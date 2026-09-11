@@ -12,7 +12,7 @@ import {
   SafeAreaView,
 } from 'react-native';
 import { TelegramLink, LinkCodeResponse } from '../types';
-import { fetchTelegramLinks, generateLinkCode } from '../services/api';
+import { fetchTelegramLinks, generateLinkCode, syncTelegramLibrary } from '../services/api';
 import { useAppTheme } from '../theme/ThemeContext';
 
 interface TelegramScreenProps {
@@ -33,6 +33,7 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
   const [linkCodeData, setLinkCodeData] = useState<LinkCodeResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [generating, setGenerating] = useState<boolean>(false);
+  const [syncing, setSyncing] = useState<boolean>(false);
 
   const loadLinks = useCallback(async () => {
     setLoading(true);
@@ -45,6 +46,22 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
       setLoading(false);
     }
   }, []);
+
+  const handleSyncLibrary = async () => {
+    setSyncing(true);
+    try {
+      const res = await syncTelegramLibrary();
+      Alert.alert(
+        '¡Sincronización Exitosa!',
+        `Libros en catálogo: ${res.active_books}\nEstantes organizados: ${res.active_topics}`
+      );
+      loadLinks();
+    } catch (err: any) {
+      Alert.alert('Error', 'No se pudo sincronizar con Telegram: ' + (err.message || 'Error de red'));
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   useEffect(() => {
     loadLinks();
@@ -256,7 +273,28 @@ export const TelegramScreen: React.FC<TelegramScreenProps> = ({
           )}
         </View>
 
-        {/* TARJETA 3: GUÍA DE CONFIGURACIÓN PASO A PASO */}
+        {/* TARJETA 3: SINCRONIZACIÓN DE LIBROS CON TELEGRAM */}
+        <View style={[styles.card, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
+          <Text style={[styles.cardTitle, { color: c.textPrimary }]}>
+            🔄 Sincronización con Telegram
+          </Text>
+          <Text style={[styles.stepDesc, { color: c.textSecondary, marginBottom: 12 }]}>
+            Comprueba y actualiza tu biblioteca móvil con todos los libros y temas archivados en tu grupo de Telegram.
+          </Text>
+          <TouchableOpacity
+            style={[styles.generateBtn, { backgroundColor: c.accent }]}
+            onPress={handleSyncLibrary}
+            disabled={syncing}
+          >
+            {syncing ? (
+              <ActivityIndicator color="#FAF7F2" />
+            ) : (
+              <Text style={styles.generateBtnText}>🔄 Sincronizar Libros Ahora</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+
+        {/* TARJETA 4: GUÍA DE CONFIGURACIÓN PASO A PASO */}
         <View style={[styles.card, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
           <Text style={[styles.cardTitle, { color: c.textPrimary }]}>
             📖 Guía para el Administrador del Grupo

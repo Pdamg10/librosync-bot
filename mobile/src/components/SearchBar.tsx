@@ -6,6 +6,7 @@ import {
   Text,
   StyleSheet,
 } from 'react-native';
+import { useAppTheme } from '../theme/ThemeContext';
 
 interface SearchBarProps {
   value: string;
@@ -20,22 +21,25 @@ export const SearchBar: React.FC<SearchBarProps> = ({
   onClear,
   placeholder = 'Buscar por título o autor...',
 }) => {
+  const { theme } = useAppTheme();
+  const c = theme.colors;
+
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
       <Text style={styles.searchIcon}>🔍</Text>
       <TextInput
-        style={styles.input}
+        style={[styles.input, { color: c.textPrimary }]}
         value={value}
         onChangeText={onChangeText}
         placeholder={placeholder}
-        placeholderTextColor="#A39587"
+        placeholderTextColor={c.textMuted}
         returnKeyType="search"
         autoCapitalize="none"
         autoCorrect={false}
       />
       {value.length > 0 && (
         <TouchableOpacity onPress={onClear} style={styles.clearButton} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-          <Text style={styles.clearIcon}>✕</Text>
+          <Text style={[styles.clearIcon, { color: c.textSecondary }]}>✕</Text>
         </TouchableOpacity>
       )}
     </View>

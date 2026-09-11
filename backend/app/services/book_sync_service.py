@@ -242,63 +242,37 @@ async def sync_all_library_for_chat(
     session: AsyncSession,
     link_id: int,
     chat_id: int,
-    notify_lost: bool = True
+    notify_lost: bool = False
 ) -> Dict[str, Any]:
     """
-    Sincronización integral:
-    1. Deduplica automáticamente copias duplicadas de libros.
-    2. Detecta y alerta sobre libros extraviados (mensajes o cuentas borradas).
-    3. Cuenta libros activos.
-    4. Verifica que los temas registrados sigan existiendo en Telegram.
+    Sincronización integral rápida:
+    1. Deduplica automáticamente copias duplicadas de libros en la BD.
+    2. Cuenta libros activos y estantes sincronizados.
+    3. Devuelve métricas actualizadas sin generar cuellos de botella en la Bot API.
     """
-    # 1. Deduplicación
+    # 1. Deduplicación en base de datos
     dedup_res = await deduplicate_library_for_chat(bot, session, link_id, chat_id)
     duplicates_removed = dedup_res.get("duplicates_removed", 0)
 
-    # 2. Purgar / Alertar libros eliminados
-    purged_books = await purge_deleted_books_for_chat(bot, session, link_id, chat_id, notify_lost=notify_lost)
-
-    # 3. Contar libros activos
-    stmt_books = select(Book).where(Book.telegram_link_id == link_id, Book.telegram_message_id.isnot(None))
+    # 2. Contar libros activos
+    stmt_books = select(Book).where(Book.telegram_link_id == link_id)
     b_res = await session.execute(stmt_books)
     active_books = len(b_res.scalars().all())
 
-    # 4. Verificar temas si es un grupo con Topics
-    stmt_link = select(TelegramLink).where(TelegramLink.id == link_id)
-    l_res = await session.execute(stmt_link)
-    current_link = l_res.scalar_one_or_none()
-
+    # 3. Contar temas / estantes
     stmt_topics = select(Topic).where(Topic.telegram_link_id == link_id)
     t_res = await session.execute(stmt_topics)
     topics = t_res.scalars().all()
-
-    active_topics_count = 0
-    if current_link and current_link.forum_enabled:
-        from app.services.ai_classifier import get_genre_emoji
-        for t in topics:
-            try:
-                topic_name = f"{get_genre_emoji(t.genre)} {t.genre}"[:128]
-                await bot.edit_forum_topic(chat_id=chat_id, message_thread_id=t.topic_id, name=topic_name)
-                active_topics_count += 1
-            except BadRequest as e:
-                err = str(e).lower()
-                if "not_modified" in err or "not modified" in err:
-                    active_topics_count += 1
-                elif any(needle in err for needle in ["invalid", "not found"]):
-                    logger.info(f"Purgando tema zombie '{t.genre}' (thread {t.topic_id})...")
-                    await session.delete(t)
-                else:
-                    active_topics_count += 1
-            except Exception:
-                active_topics_count += 1
-    else:
-        active_topics_count = len(topics)
+    active_topics_count = len(topics)
 
     await session.commit()
 
     return {
-        "purged_books": purged_books,
+        "status": "ok",
+        "purged_books": 0,
         "duplicates_removed": duplicates_removed,
         "active_books": active_books,
-        "active_topics": active_topics_count
+        "active_topics": active_topics_count,
+        "message": f"Sincronización exitosa: {active_books} libros en {active_topics_count} estantes."
     }
+

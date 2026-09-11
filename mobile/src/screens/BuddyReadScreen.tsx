@@ -159,12 +159,14 @@ export function BuddyReadScreen({
           </View>
         </View>
 
-        <TouchableOpacity
-          onPress={() => setIsCreateModalVisible(true)}
-          style={[styles.createBtn, { backgroundColor: c.accent }]}
-        >
-          <Text style={styles.createBtnText}>+ Iniciar</Text>
-        </TouchableOpacity>
+        {buddyReads.length > 0 && (
+          <TouchableOpacity
+            onPress={() => setIsCreateModalVisible(true)}
+            style={[styles.createBtn, { backgroundColor: c.accent }]}
+          >
+            <Text style={styles.createBtnText}>+ Iniciar</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {/* Banner Informativo del Club */}

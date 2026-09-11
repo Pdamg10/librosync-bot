@@ -1,6 +1,7 @@
 import React from 'react';
 import { TouchableOpacity, Text, StyleSheet } from 'react-native';
-import { colors, getGenreEmoji } from '../theme/colors';
+import { getGenreEmoji } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 
 interface GenreChipProps {
   genre: string;
@@ -15,8 +16,9 @@ export const GenreChip: React.FC<GenreChipProps> = ({
   onPress,
   count,
 }) => {
+  const { theme } = useAppTheme();
+  const c = theme.colors;
   const emoji = getGenreEmoji(genre);
-  const theme = colors.dark;
 
   return (
     <TouchableOpacity
@@ -24,14 +26,17 @@ export const GenreChip: React.FC<GenreChipProps> = ({
       onPress={onPress}
       style={[
         styles.chip,
-        isSelected ? styles.chipSelected : styles.chipUnselected,
+        {
+          backgroundColor: isSelected ? c.accent : c.cardBg,
+          borderColor: isSelected ? c.accent : c.cardBorder,
+        },
       ]}
     >
       <Text style={styles.emoji}>{emoji}</Text>
       <Text
         style={[
           styles.text,
-          isSelected ? styles.textSelected : styles.textUnselected,
+          { color: isSelected ? '#FFFFFF' : c.textPrimary },
         ]}
       >
         {genre}
@@ -40,7 +45,9 @@ export const GenreChip: React.FC<GenreChipProps> = ({
         <Text
           style={[
             styles.badge,
-            isSelected ? styles.badgeSelected : styles.badgeUnselected,
+            isSelected
+              ? styles.badgeSelected
+              : [styles.badgeUnselected, { backgroundColor: c.cardSecondaryBg, color: c.textSecondary }],
           ]}
         >
           {count}

@@ -52,3 +52,12 @@ class BookOut(BookBase):
     reading_progress: float
 
     model_config = ConfigDict(from_attributes=True)
+
+class ChatRequest(BaseModel):
+    message: str
+    user_id: Optional[int] = 1
+    telegram_link_id: Optional[int] = None
+
+class ChatResponse(BaseModel):
+    reply: str
+    recommended_books: list[BookOut] = []

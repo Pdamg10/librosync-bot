@@ -30,6 +30,7 @@ import { GenreChip } from '../components/GenreChip';
 import { SearchBar } from '../components/SearchBar';
 import { ReaderModal } from '../components/ReaderModal';
 import { UploadModal } from '../components/UploadModal';
+import { useAppTheme } from '../theme/ThemeContext';
 
 type MainViewTab = 'catalog' | 'shelves' | 'buddy';
 type ShelfTab = 'reading' | 'favorites' | 'to_read' | 'finished';
@@ -53,6 +54,8 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   onShelvesLoaded,
   onOpenBookDetail,
 }) => {
+  const { theme } = useAppTheme();
+  const c = theme.colors;
   const { isTablet, numColumns, cardWidth } = useResponsive();
 
   const [activeTab, setActiveTab] = useState<MainViewTab>(initialTab || 'catalog');
@@ -228,15 +231,15 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   return (
     <View style={styles.container}>
       {/* Top Banner / Header */}
-      <View style={styles.header}>
+      <View style={[styles.header, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
         <View style={styles.headerLeftGroup}>
           {onOpenDrawer && (
             <TouchableOpacity
               onPress={onOpenDrawer}
-              style={styles.drawerTriggerBtn}
+              style={[styles.drawerTriggerBtn, { backgroundColor: c.cardSecondaryBg }]}
               accessibilityLabel="Abrir menú lateral"
             >
-              <Text style={styles.drawerTriggerIcon}>☰</Text>
+              <Text style={[styles.drawerTriggerIcon, { color: c.textPrimary }]}>☰</Text>
             </TouchableOpacity>
           )}
           <View style={styles.brandContainer}>
@@ -252,16 +255,16 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
           {onNavigateToChat && (
             <TouchableOpacity
               onPress={onNavigateToChat}
-              style={styles.chatHeaderBtn}
+              style={[styles.chatHeaderBtn, { backgroundColor: c.cardSecondaryBg }]}
               accessibilityLabel="Chat con Griffin"
             >
-              <Text style={styles.chatHeaderIcon}>💬</Text>
+              <Text style={styles.chatHeaderIcon}>🦉</Text>
             </TouchableOpacity>
           )}
 
           <TouchableOpacity
             onPress={() => setIsUploadModalVisible(true)}
-            style={styles.uploadBtn}
+            style={[styles.uploadBtn, { backgroundColor: c.accent }]}
           >
             <Text style={styles.uploadBtnText}>+ Subir</Text>
           </TouchableOpacity>
@@ -270,49 +273,49 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
 
       {/* Stats Cards */}
       <View style={styles.statsContainer}>
-        <View style={styles.statBox}>
-          <Text style={styles.statNumber}>{stats.total}</Text>
-          <Text style={styles.statLabel}>Libros</Text>
+        <View style={[styles.statBox, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
+          <Text style={[styles.statNumber, { color: c.textPrimary }]}>{stats.total}</Text>
+          <Text style={[styles.statLabel, { color: c.textSecondary }]}>Libros</Text>
         </View>
-        <View style={styles.statBox}>
+        <View style={[styles.statBox, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
           <Text style={[styles.statNumber, { color: '#38bdf8' }]}>{stats.inProgress}</Text>
-          <Text style={styles.statLabel}>Leyendo</Text>
+          <Text style={[styles.statLabel, { color: c.textSecondary }]}>Leyendo</Text>
         </View>
-        <View style={styles.statBox}>
+        <View style={[styles.statBox, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
           <Text style={[styles.statNumber, { color: '#fbbf24' }]}>{stats.favCount}</Text>
-          <Text style={styles.statLabel}>Favoritos</Text>
+          <Text style={[styles.statLabel, { color: c.textSecondary }]}>Favoritos</Text>
         </View>
-        <View style={styles.statBox}>
+        <View style={[styles.statBox, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}>
           <Text style={[styles.statNumber, { color: '#10b981' }]}>{stats.completed}</Text>
-          <Text style={styles.statLabel}>Terminados</Text>
+          <Text style={[styles.statLabel, { color: c.textSecondary }]}>Terminados</Text>
         </View>
       </View>
 
       {/* Navigation Segmented Control */}
-      <View style={styles.segmentedControl}>
+      <View style={[styles.segmentedControl, { backgroundColor: c.cardSecondaryBg }]}>
         <TouchableOpacity
-          style={[styles.segmentBtn, activeTab === 'catalog' && styles.segmentBtnActive]}
+          style={[styles.segmentBtn, activeTab === 'catalog' && [styles.segmentBtnActive, { backgroundColor: c.cardBg }]]}
           onPress={() => setActiveTab('catalog')}
         >
-          <Text style={[styles.segmentText, activeTab === 'catalog' && styles.segmentTextActive]}>
+          <Text style={[styles.segmentText, { color: activeTab === 'catalog' ? c.textPrimary : c.textSecondary }, activeTab === 'catalog' && styles.segmentTextActive]}>
             📚 Catálogo
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.segmentBtn, activeTab === 'shelves' && styles.segmentBtnActive]}
+          style={[styles.segmentBtn, activeTab === 'shelves' && [styles.segmentBtnActive, { backgroundColor: c.cardBg }]]}
           onPress={() => setActiveTab('shelves')}
         >
-          <Text style={[styles.segmentText, activeTab === 'shelves' && styles.segmentTextActive]}>
+          <Text style={[styles.segmentText, { color: activeTab === 'shelves' ? c.textPrimary : c.textSecondary }, activeTab === 'shelves' && styles.segmentTextActive]}>
             📖 Mis Estantes
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.segmentBtn, activeTab === 'buddy' && styles.segmentBtnActive]}
+          style={[styles.segmentBtn, activeTab === 'buddy' && [styles.segmentBtnActive, { backgroundColor: c.cardBg }]]}
           onPress={() => setActiveTab('buddy')}
         >
-          <Text style={[styles.segmentText, activeTab === 'buddy' && styles.segmentTextActive]}>
+          <Text style={[styles.segmentText, { color: activeTab === 'buddy' ? c.textPrimary : c.textSecondary }, activeTab === 'buddy' && styles.segmentTextActive]}>
             👥 Lectura Conjunta
           </Text>
         </TouchableOpacity>

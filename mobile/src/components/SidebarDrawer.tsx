@@ -26,7 +26,7 @@ interface SidebarDrawerProps {
 }
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const DRAWER_WIDTH = Math.min(SCREEN_WIDTH * 0.82, 340);
+const DRAWER_WIDTH = Math.min(SCREEN_WIDTH * 0.85, 340);
 
 export function SidebarDrawer({
   isOpen,
@@ -118,7 +118,7 @@ export function SidebarDrawer({
           <Animated.View style={[styles.backdrop, { opacity: fadeAnim }]} />
         </TouchableWithoutFeedback>
 
-        {/* Contenedor del Drawer deslizante */}
+        {/* Contenedor del Drawer deslizante adaptado a temas */}
         <Animated.View
           style={[
             styles.drawerContainer,
@@ -141,7 +141,9 @@ export function SidebarDrawer({
                   <Text style={styles.avatarEmoji}>👩‍🌾</Text>
                 </View>
                 <View style={styles.profileInfo}>
-                  <Text style={[styles.userName, { color: c.textPrimary }]} numberOfLines={1}>{userName}</Text>
+                  <Text style={[styles.userName, { color: c.textPrimary }]} numberOfLines={1}>
+                    {userName}
+                  </Text>
                   <Text style={[styles.groupBadge, { color: c.textSecondary }]} numberOfLines={1}>
                     {groupTitle}
                   </Text>
@@ -165,16 +167,16 @@ export function SidebarDrawer({
             <TouchableOpacity
               style={[
                 styles.navItem,
-                activeScreen === 'library' && styles.navItemActive,
+                activeScreen === 'library' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
               ]}
               onPress={() => handleNavigate('library', 'catalog')}
             >
               <View style={styles.navItemLeft}>
                 <Text style={styles.navIcon}>📚</Text>
-                <Text style={styles.navLabel}>Catálogo General</Text>
+                <Text style={[styles.navLabel, { color: c.textPrimary }]}>Catálogo General</Text>
               </View>
-              <View style={styles.badgePill}>
-                <Text style={styles.badgePillText}>{totalBooksCount}</Text>
+              <View style={[styles.badgePill, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
+                <Text style={[styles.badgePillText, { color: c.textSecondary }]}>{totalBooksCount}</Text>
               </View>
             </TouchableOpacity>
 
@@ -184,51 +186,56 @@ export function SidebarDrawer({
                 style={[
                   styles.navItem,
                   styles.shelfHeaderItem,
-                  expandedShelf === 'reading' && styles.navItemActive,
+                  expandedShelf === 'reading' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
                 ]}
                 onPress={() => toggleShelf('reading')}
               >
                 <View style={styles.navItemLeft}>
                   <Text style={styles.navIcon}>📖</Text>
-                  <Text style={styles.navLabel}>Libros en curso</Text>
+                  <Text style={[styles.navLabel, { color: c.textPrimary }]}>Libros en curso</Text>
                 </View>
                 <View style={styles.shelfHeaderRight}>
                   <View style={[styles.badgePill, styles.badgePillReading]}>
                     <Text style={styles.badgePillReadingText}>{readingBooks.length}</Text>
                   </View>
-                  <Text style={styles.chevronIcon}>
+                  <Text style={[styles.chevronIcon, { color: c.textMuted }]}>
                     {expandedShelf === 'reading' ? '▲' : '▼'}
                   </Text>
                 </View>
               </TouchableOpacity>
 
               {expandedShelf === 'reading' && (
-                <View style={styles.shelfBooksList}>
+                <View style={[styles.shelfBooksList, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
                   {readingBooks.length === 0 ? (
-                    <Text style={styles.emptyShelfText}>No tienes libros en lectura ahora.</Text>
+                    <Text style={[styles.emptyShelfText, { color: c.textSecondary }]}>
+                      No tienes libros en lectura ahora.
+                    </Text>
                   ) : (
                     readingBooks.map((item) => (
                       <TouchableOpacity
                         key={item.id}
-                        style={styles.drawerBookCard}
+                        style={[styles.drawerBookCard, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
                         onPress={() => handleBookPress(item)}
                       >
                         <View style={styles.drawerBookTopRow}>
-                          <Text style={styles.drawerBookTitle} numberOfLines={1}>
+                          <Text style={[styles.drawerBookTitle, { color: c.textPrimary }]} numberOfLines={1}>
                             {item.book?.title || 'Libro en lectura'}
                           </Text>
-                          <Text style={styles.drawerBookPercent}>
+                          <Text style={[styles.drawerBookPercent, { color: c.accent }]}>
                             {Math.round(item.progress_percent)}%
                           </Text>
                         </View>
-                        <Text style={styles.drawerBookAuthor} numberOfLines={1}>
+                        <Text style={[styles.drawerBookAuthor, { color: c.textSecondary }]} numberOfLines={1}>
                           {item.book?.author || 'Autor desconocido'}
                         </Text>
-                        <View style={styles.progressBarBg}>
+                        <View style={[styles.progressBarBg, { backgroundColor: c.cardSecondaryBg }]}>
                           <View
                             style={[
                               styles.progressBarFill,
-                              { width: `${Math.min(Math.max(item.progress_percent, 5), 100)}%` },
+                              {
+                                backgroundColor: c.accent,
+                                width: `${Math.min(Math.max(item.progress_percent, 5), 100)}%`,
+                              },
                             ]}
                           />
                         </View>
@@ -239,7 +246,9 @@ export function SidebarDrawer({
                     style={styles.viewMoreLink}
                     onPress={() => handleNavigate('library', 'shelves:reading')}
                   >
-                    <Text style={styles.viewMoreLinkText}>Ver en estantería completa →</Text>
+                    <Text style={[styles.viewMoreLinkText, { color: c.accent }]}>
+                      Ver en estantería completa →
+                    </Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -251,42 +260,44 @@ export function SidebarDrawer({
                 style={[
                   styles.navItem,
                   styles.shelfHeaderItem,
-                  expandedShelf === 'finished' && styles.navItemActive,
+                  expandedShelf === 'finished' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
                 ]}
                 onPress={() => toggleShelf('finished')}
               >
                 <View style={styles.navItemLeft}>
                   <Text style={styles.navIcon}>🏆</Text>
-                  <Text style={styles.navLabel}>Libros terminados</Text>
+                  <Text style={[styles.navLabel, { color: c.textPrimary }]}>Libros terminados</Text>
                 </View>
                 <View style={styles.shelfHeaderRight}>
                   <View style={[styles.badgePill, styles.badgePillFinished]}>
                     <Text style={styles.badgePillFinishedText}>{finishedBooks.length}</Text>
                   </View>
-                  <Text style={styles.chevronIcon}>
+                  <Text style={[styles.chevronIcon, { color: c.textMuted }]}>
                     {expandedShelf === 'finished' ? '▲' : '▼'}
                   </Text>
                 </View>
               </TouchableOpacity>
 
               {expandedShelf === 'finished' && (
-                <View style={styles.shelfBooksList}>
+                <View style={[styles.shelfBooksList, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
                   {finishedBooks.length === 0 ? (
-                    <Text style={styles.emptyShelfText}>Aún no has completado libros.</Text>
+                    <Text style={[styles.emptyShelfText, { color: c.textSecondary }]}>
+                      Aún no has completado libros.
+                    </Text>
                   ) : (
                     finishedBooks.map((item) => (
                       <TouchableOpacity
                         key={item.id}
-                        style={styles.drawerBookCard}
+                        style={[styles.drawerBookCard, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
                         onPress={() => handleBookPress(item)}
                       >
                         <View style={styles.drawerBookTopRow}>
-                          <Text style={styles.drawerBookTitle} numberOfLines={1}>
+                          <Text style={[styles.drawerBookTitle, { color: c.textPrimary }]} numberOfLines={1}>
                             {item.book?.title || 'Libro leído'}
                           </Text>
                           <Text style={styles.badgeCompletedLabel}>100%</Text>
                         </View>
-                        <Text style={styles.drawerBookAuthor} numberOfLines={1}>
+                        <Text style={[styles.drawerBookAuthor, { color: c.textSecondary }]} numberOfLines={1}>
                           {item.book?.author || 'Autor'}
                         </Text>
                       </TouchableOpacity>
@@ -296,7 +307,9 @@ export function SidebarDrawer({
                     style={styles.viewMoreLink}
                     onPress={() => handleNavigate('library', 'shelves:finished')}
                   >
-                    <Text style={styles.viewMoreLinkText}>Ver historial de lecturas →</Text>
+                    <Text style={[styles.viewMoreLinkText, { color: c.accent }]}>
+                      Ver historial de lecturas →
+                    </Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -308,42 +321,44 @@ export function SidebarDrawer({
                 style={[
                   styles.navItem,
                   styles.shelfHeaderItem,
-                  expandedShelf === 'to_read' && styles.navItemActive,
+                  expandedShelf === 'to_read' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
                 ]}
                 onPress={() => toggleShelf('to_read')}
               >
                 <View style={styles.navItemLeft}>
                   <Text style={styles.navIcon}>📌</Text>
-                  <Text style={styles.navLabel}>Pendientes por leer</Text>
+                  <Text style={[styles.navLabel, { color: c.textPrimary }]}>Pendientes por leer</Text>
                 </View>
                 <View style={styles.shelfHeaderRight}>
-                  <View style={styles.badgePill}>
-                    <Text style={styles.badgePillText}>{toReadBooks.length}</Text>
+                  <View style={[styles.badgePill, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
+                    <Text style={[styles.badgePillText, { color: c.textSecondary }]}>{toReadBooks.length}</Text>
                   </View>
-                  <Text style={styles.chevronIcon}>
+                  <Text style={[styles.chevronIcon, { color: c.textMuted }]}>
                     {expandedShelf === 'to_read' ? '▲' : '▼'}
                   </Text>
                 </View>
               </TouchableOpacity>
 
               {expandedShelf === 'to_read' && (
-                <View style={styles.shelfBooksList}>
+                <View style={[styles.shelfBooksList, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
                   {toReadBooks.length === 0 ? (
-                    <Text style={styles.emptyShelfText}>No hay libros en tu lista de deseos.</Text>
+                    <Text style={[styles.emptyShelfText, { color: c.textSecondary }]}>
+                      No hay libros en tu lista de deseos.
+                    </Text>
                   ) : (
                     toReadBooks.map((item) => (
                       <TouchableOpacity
                         key={item.id}
-                        style={styles.drawerBookCard}
+                        style={[styles.drawerBookCard, { backgroundColor: c.cardBg, borderColor: c.cardBorder }]}
                         onPress={() => handleBookPress(item)}
                       >
                         <View style={styles.drawerBookTopRow}>
-                          <Text style={styles.drawerBookTitle} numberOfLines={1}>
+                          <Text style={[styles.drawerBookTitle, { color: c.textPrimary }]} numberOfLines={1}>
                             {item.book?.title || 'Libro pendiente'}
                           </Text>
                           <Text style={styles.badgePendingLabel}>0%</Text>
                         </View>
-                        <Text style={styles.drawerBookAuthor} numberOfLines={1}>
+                        <Text style={[styles.drawerBookAuthor, { color: c.textSecondary }]} numberOfLines={1}>
                           {item.book?.author || 'Autor'}
                         </Text>
                       </TouchableOpacity>
@@ -353,7 +368,9 @@ export function SidebarDrawer({
                     style={styles.viewMoreLink}
                     onPress={() => handleNavigate('library', 'shelves:to_read')}
                   >
-                    <Text style={styles.viewMoreLinkText}>Ver lista de espera →</Text>
+                    <Text style={[styles.viewMoreLinkText, { color: c.accent }]}>
+                      Ver lista de espera →
+                    </Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -366,103 +383,104 @@ export function SidebarDrawer({
             >
               <View style={styles.navItemLeft}>
                 <Text style={styles.navIcon}>⭐</Text>
-                <Text style={styles.navLabel}>Favoritos</Text>
+                <Text style={[styles.navLabel, { color: c.textPrimary }]}>Favoritos</Text>
               </View>
-              <View style={styles.badgePill}>
-                <Text style={styles.badgePillText}>{favoriteCount}</Text>
+              <View style={[styles.badgePill, { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder }]}>
+                <Text style={[styles.badgePillText, { color: c.textSecondary }]}>{favoriteCount}</Text>
               </View>
             </TouchableOpacity>
 
             {/* Lectura en conjunto (Club) - Ventana Dedicada */}
             <TouchableOpacity
-              style={[styles.navItem, activeScreen === 'buddy' && styles.navItemActive]}
+              style={[styles.navItem, activeScreen === 'buddy' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }]]}
               onPress={() => handleNavigate('buddy')}
             >
               <View style={styles.navItemLeft}>
                 <Text style={styles.navIcon}>👥</Text>
-                <Text style={styles.navLabel}>Lectura Conjunta</Text>
+                <Text style={[styles.navLabel, { color: c.textPrimary }]}>Lectura Conjunta</Text>
               </View>
               <View style={[styles.badgePill, styles.badgePillClub]}>
                 <Text style={styles.badgePillClubText}>En vivo</Text>
               </View>
             </TouchableOpacity>
 
-            <View style={styles.divider} />
+            <View style={[styles.divider, { backgroundColor: c.cardBorder }]} />
 
             {/* SECCIÓN 2: HERRAMIENTAS, CHAT & PERSONALIZACIÓN */}
-            <Text style={styles.sectionLabel}>FUNCIONES & ASISTENTE</Text>
+            <Text style={[styles.sectionLabel, { color: c.textMuted }]}>FUNCIONES & ASISTENTE</Text>
 
-            {/* Chat con Griffin (Asistente IA) */}
+            {/* Chat con Griffin (Asistente IA con Gemini y base de datos) */}
             <TouchableOpacity
               style={[
                 styles.navItem,
                 styles.chatHighlightItem,
-                activeScreen === 'chat' && styles.navItemActive,
+                { backgroundColor: c.cardSecondaryBg, borderColor: c.cardBorder },
+                activeScreen === 'chat' && [styles.navItemActive, { borderColor: c.accent }],
               ]}
               onPress={() => handleNavigate('chat')}
             >
               <View style={styles.navItemLeft}>
-                <Text style={styles.navIcon}>💬</Text>
+                <Text style={styles.navIcon}>🦉</Text>
                 <View>
-                  <Text style={styles.navLabel}>Chat con Griffin</Text>
-                  <Text style={styles.navSublabel}>Bibliotecario IA en vivo</Text>
+                  <Text style={[styles.navLabel, { color: c.textPrimary }]}>Griffin IA</Text>
+                  <Text style={[styles.navSublabel, { color: c.textSecondary }]}>Bibliotecario Inteligente</Text>
                 </View>
               </View>
-              <View style={styles.assistantBadge}>
+              <View style={[styles.assistantBadge, { backgroundColor: c.accent }]}>
                 <Text style={styles.assistantBadgeText}>AI</Text>
               </View>
             </TouchableOpacity>
 
-            {/* Personalización (Fondo sólido, degradado, foto/video/gif) */}
+            {/* Personalización (Fondo sólido, degradado, imagen, gif, video) */}
             <TouchableOpacity
               style={[
                 styles.navItem,
-                activeScreen === 'customize' && styles.navItemActive,
+                activeScreen === 'customize' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
               ]}
               onPress={() => handleNavigate('customize')}
             >
               <View style={styles.navItemLeft}>
                 <Text style={styles.navIcon}>🎨</Text>
                 <View>
-                  <Text style={styles.navLabel}>Personalización</Text>
-                  <Text style={styles.navSublabel}>Fondos, temas y multimedia</Text>
+                  <Text style={[styles.navLabel, { color: c.textPrimary }]}>Personalización</Text>
+                  <Text style={[styles.navSublabel, { color: c.textSecondary }]}>Fondos, temas y multimedia</Text>
                 </View>
               </View>
-              <Text style={styles.chevronIcon}>›</Text>
+              <Text style={[styles.chevronIcon, { color: c.textMuted }]}>›</Text>
             </TouchableOpacity>
 
             {/* Sincronización Telegram */}
             <TouchableOpacity
               style={[
                 styles.navItem,
-                activeScreen === 'telegram' && styles.navItemActive,
+                activeScreen === 'telegram' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
               ]}
               onPress={() => handleNavigate('telegram')}
             >
               <View style={styles.navItemLeft}>
                 <Text style={styles.navIcon}>📱</Text>
-                <Text style={styles.navLabel}>Grupos Telegram</Text>
+                <Text style={[styles.navLabel, { color: c.textPrimary }]}>Grupos Telegram</Text>
               </View>
-              <Text style={styles.chevronIcon}>›</Text>
+              <Text style={[styles.chevronIcon, { color: c.textMuted }]}>›</Text>
             </TouchableOpacity>
 
             {/* Ajustes Generales */}
             <TouchableOpacity
               style={[
                 styles.navItem,
-                activeScreen === 'settings' && styles.navItemActive,
+                activeScreen === 'settings' && [styles.navItemActive, { backgroundColor: c.cardSecondaryBg }],
               ]}
               onPress={() => handleNavigate('settings')}
             >
               <View style={styles.navItemLeft}>
                 <Text style={styles.navIcon}>⚙️</Text>
-                <Text style={styles.navLabel}>Ajustes de Lectura</Text>
+                <Text style={[styles.navLabel, { color: c.textPrimary }]}>Ajustes y Conexión</Text>
               </View>
-              <Text style={styles.chevronIcon}>›</Text>
+              <Text style={[styles.chevronIcon, { color: c.textMuted }]}>›</Text>
             </TouchableOpacity>
 
-            {/* SECCIÓN 3: BOTÓN SUSCRIPCIÓN / CLUB VIP (Inspirado en la imagen de referencia) */}
-            <View style={styles.subscribeCard}>
+            {/* SECCIÓN 3: CLUB VIP */}
+            <View style={[styles.subscribeCard, { backgroundColor: '#3B5B75' }]}>
               <View style={styles.subscribeHeader}>
                 <View style={styles.subscribeBellCircle}>
                   <Text style={styles.subscribeBellIcon}>🔔</Text>
@@ -482,8 +500,8 @@ export function SidebarDrawer({
 
             {/* Pie del Drawer */}
             <View style={styles.drawerFooter}>
-              <Text style={styles.footerBrand}>LibroSync • Anaquel v1.0</Text>
-              <Text style={styles.footerNote}>Clasificación asistida por IA</Text>
+              <Text style={[styles.footerBrand, { color: c.textSecondary }]}>LibroSync • Anaquel v1.0</Text>
+              <Text style={[styles.footerNote, { color: c.textMuted }]}>Impulsado por Gemini IA y Telegram</Text>
             </View>
           </ScrollView>
         </Animated.View>
@@ -499,17 +517,15 @@ const styles = StyleSheet.create({
   },
   backdrop: {
     ...StyleSheet.absoluteFill,
-    backgroundColor: 'rgba(44, 34, 30, 0.45)',
+    backgroundColor: 'rgba(20, 15, 12, 0.55)',
   },
   drawerContainer: {
     width: DRAWER_WIDTH,
     height: '100%',
-    backgroundColor: '#FAF7F2',
     borderRightWidth: 1,
-    borderRightColor: '#DFD5C6',
-    shadowColor: '#2C221E',
+    shadowColor: '#000',
     shadowOffset: { width: 4, height: 0 },
-    shadowOpacity: 0.15,
+    shadowOpacity: 0.2,
     shadowRadius: 12,
     elevation: 16,
   },
@@ -530,18 +546,16 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   avatarContainer: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    backgroundColor: '#EDE5D8',
-    borderWidth: 2,
-    borderColor: '#DFD5C6',
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    borderWidth: 1.5,
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 12,
   },
   avatarEmoji: {
-    fontSize: 28,
+    fontSize: 26,
   },
   profileInfo: {
     flex: 1,
@@ -549,19 +563,16 @@ const styles = StyleSheet.create({
   userName: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#2C221E',
     marginBottom: 2,
   },
   groupBadge: {
     fontSize: 12,
-    color: '#7A6E65',
     fontWeight: '500',
   },
   closeBtn: {
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: '#EDE5D8',
     alignItems: 'center',
     justifyContent: 'center',
     marginLeft: 8,
@@ -569,18 +580,15 @@ const styles = StyleSheet.create({
   closeBtnText: {
     fontSize: 14,
     fontWeight: '700',
-    color: '#7A6E65',
   },
   divider: {
     height: 1,
-    backgroundColor: '#E5DDD0',
     marginVertical: 14,
   },
   sectionLabel: {
     fontSize: 11,
     fontWeight: '700',
     letterSpacing: 0.8,
-    color: '#9C8E82',
     marginBottom: 8,
     marginTop: 4,
     textTransform: 'uppercase',
@@ -596,7 +604,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   navItemActive: {
-    backgroundColor: '#EDE5D8',
+    borderRadius: 12,
   },
   navItemLeft: {
     flexDirection: 'row',
@@ -612,25 +620,20 @@ const styles = StyleSheet.create({
   navLabel: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#2C221E',
   },
   navSublabel: {
     fontSize: 11,
-    color: '#7A6E65',
     marginTop: 1,
   },
   badgePill: {
-    backgroundColor: '#EDE5D8',
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: '#DFD5C6',
   },
   badgePillText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#7A6E65',
   },
   badgePillReading: {
     backgroundColor: '#FEF3C7',
@@ -661,7 +664,6 @@ const styles = StyleSheet.create({
   },
   chevronIcon: {
     fontSize: 12,
-    color: '#9C8E82',
     fontWeight: '700',
   },
   shelfBlock: {
@@ -676,27 +678,22 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   shelfBooksList: {
-    backgroundColor: '#F4ECE1',
     borderRadius: 12,
     padding: 10,
     marginBottom: 6,
     borderWidth: 1,
-    borderColor: '#E5DDD0',
   },
   emptyShelfText: {
     fontSize: 12,
-    color: '#7A6E65',
     fontStyle: 'italic',
     paddingVertical: 6,
     paddingHorizontal: 4,
   },
   drawerBookCard: {
-    backgroundColor: '#FBF8F3',
     borderRadius: 8,
     padding: 8,
     marginBottom: 6,
     borderWidth: 1,
-    borderColor: '#DFD5C6',
   },
   drawerBookTopRow: {
     flexDirection: 'row',
@@ -707,35 +704,30 @@ const styles = StyleSheet.create({
   drawerBookTitle: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#2C221E',
     flex: 1,
     marginRight: 6,
   },
   drawerBookPercent: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#D97706',
   },
   drawerBookAuthor: {
     fontSize: 11,
-    color: '#7A6E65',
     marginBottom: 5,
   },
   progressBarBg: {
     height: 4,
-    backgroundColor: '#E5DDD0',
     borderRadius: 2,
     overflow: 'hidden',
   },
   progressBarFill: {
     height: '100%',
-    backgroundColor: '#D97706',
     borderRadius: 2,
   },
   badgeCompletedLabel: {
     fontSize: 10,
     fontWeight: '700',
-    color: '#059669',
+    color: '#047857',
     backgroundColor: '#D1FAE5',
     paddingHorizontal: 5,
     paddingVertical: 1,
@@ -757,15 +749,11 @@ const styles = StyleSheet.create({
   viewMoreLinkText: {
     fontSize: 11,
     fontWeight: '600',
-    color: '#8C5A2B',
   },
   chatHighlightItem: {
-    backgroundColor: '#F3EDE2',
     borderWidth: 1,
-    borderColor: '#DFD5C6',
   },
   assistantBadge: {
-    backgroundColor: '#8E75B2',
     paddingHorizontal: 7,
     paddingVertical: 2,
     borderRadius: 8,
@@ -777,12 +765,11 @@ const styles = StyleSheet.create({
   },
   subscribeCard: {
     marginTop: 18,
-    backgroundColor: '#3B5B75',
     borderRadius: 16,
     padding: 14,
-    shadowColor: '#2C221E',
+    shadowColor: '#000',
     shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.12,
+    shadowOpacity: 0.15,
     shadowRadius: 6,
     elevation: 4,
   },
@@ -807,7 +794,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   subscribeTitle: {
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: '700',
     color: '#FFFFFF',
   },
@@ -817,31 +804,26 @@ const styles = StyleSheet.create({
     marginTop: 1,
   },
   subscribeBtn: {
-    backgroundColor: '#EAA023',
-    borderRadius: 10,
+    backgroundColor: '#FAF7F2',
     paddingVertical: 8,
+    borderRadius: 8,
     alignItems: 'center',
   },
   subscribeBtnText: {
+    color: '#3B5B75',
     fontSize: 12,
     fontWeight: '700',
-    color: '#2C221E',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
   },
   drawerFooter: {
     marginTop: 24,
     alignItems: 'center',
-    paddingBottom: 10,
   },
   footerBrand: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#9C8E82',
+    fontSize: 12,
+    fontWeight: '700',
   },
   footerNote: {
     fontSize: 10,
-    color: '#B0A398',
     marginTop: 2,
   },
 });

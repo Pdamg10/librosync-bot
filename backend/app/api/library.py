@@ -1,37 +1,48 @@
 import os
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 
 from app.core.database import get_db
 from app.models.book import Book
 from app.models.telegram_link import TelegramLink
-from app.schemas.book import BookOut, BookUpdate
+from app.schemas.book import BookOut, BookUpdate, ChatRequest, ChatResponse
 from app.bot.bot_instance import get_bot_application
 from app.services.telegram_service import send_book_document, get_telegram_file_bytes
 from app.services.topic_resolver import resolve_or_create_topic
+from app.services.ai_chat_service import chat_with_griffin_ai
 
 router = APIRouter(prefix="/library", tags=["Library"])
 
 @router.get("", response_model=List[BookOut])
 async def list_library(
-    user_id: int,
+    user_id: Optional[int] = Query(None),
     genre: Optional[str] = None,
     author: Optional[str] = None,
     telegram_link_id: Optional[int] = None,
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Obtiene el catálogo de libros del usuario con filtros opcionales."""
-    query = select(Book).where(Book.user_id == user_id)
+    """Obtiene el catálogo de libros con filtros opcionales (por grupo o por usuario)."""
+    query = select(Book)
+
+    if telegram_link_id:
+        query = query.where(Book.telegram_link_id == telegram_link_id)
+    elif user_id:
+        stmt_links = select(TelegramLink.id).where(
+            or_(TelegramLink.user_id == user_id, TelegramLink.user_id == 1)
+        )
+        link_ids = (await db.execute(stmt_links)).scalars().all()
+        conditions = [Book.user_id == user_id]
+        if link_ids:
+            conditions.append(Book.telegram_link_id.in_(link_ids))
+        query = query.where(or_(*conditions))
 
     if genre:
         query = query.where(Book.genre == genre)
     if author:
         query = query.where(Book.author.ilike(f"%{author}%"))
-    if telegram_link_id:
-        query = query.where(Book.telegram_link_id == telegram_link_id)
     if search:
         query = query.where(
             or_(
@@ -202,17 +213,57 @@ async def download_book_file(book_id: int, db: AsyncSession = Depends(get_db)):
     )
 
 
+@router.post("/chat", response_model=ChatResponse)
+async def chat_with_griffin(
+    payload: ChatRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Interactúa con Griffin IA usando Gemini y contexto real de la biblioteca
+    (progreso de lectura, novedades, catálogo del grupo y lecturas conjuntas).
+    """
+    res = await chat_with_griffin_ai(
+        session=db,
+        message=payload.message,
+        user_id=payload.user_id or 1,
+        telegram_link_id=payload.telegram_link_id
+    )
+    return res
+
+
 @router.post("/sync")
-async def sync_library(telegram_link_id: int, db: AsyncSession = Depends(get_db)):
+async def sync_library(
+    telegram_link_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db)
+):
     """Sincroniza y depura libros que hayan sido eliminados manualmente de Telegram."""
-    stmt = select(TelegramLink).where(TelegramLink.id == telegram_link_id)
-    res = await db.execute(stmt)
-    link = res.scalar_one_or_none()
+    link = None
+    if telegram_link_id:
+        stmt = select(TelegramLink).where(TelegramLink.id == telegram_link_id)
+        res = await db.execute(stmt)
+        link = res.scalar_one_or_none()
+    else:
+        stmt = select(TelegramLink).order_by(TelegramLink.id.asc()).limit(1)
+        res = await db.execute(stmt)
+        link = res.scalar_one_or_none()
+
     if not link:
-        raise HTTPException(status_code=404, detail="Vínculo de Telegram no encontrado")
+        # Si no hay vínculo registrado, contar libros totales en la BD
+        total_stmt = select(Book)
+        books_res = await db.execute(total_stmt)
+        total_books = len(books_res.scalars().all())
+        return {
+            "status": "ok",
+            "purged_books": 0,
+            "duplicates_removed": 0,
+            "active_books": total_books,
+            "active_topics": 0,
+            "message": "Sincronización local completa"
+        }
 
     bot_app = get_bot_application()
     from app.services.book_sync_service import sync_all_library_for_chat
     result = await sync_all_library_for_chat(bot_app.bot, db, link.id, link.chat_id)
     return result
+
 
