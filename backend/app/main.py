@@ -1,3 +1,5 @@
+import app.core.network_patch
+
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -23,13 +25,20 @@ async def lifespan(app: FastAPI):
 
     # 2. Inicializar y Arrancar Bot de Telegram (Polling en background)
     from app.bot.bot_instance import get_bot_application, setup_bot_commands
+    import asyncio
     bot_app = get_bot_application()
     logger.info("Iniciando bot de Telegram (Polling)...")
-    await bot_app.initialize()
-    await bot_app.start()
-    await setup_bot_commands(bot_app.bot)
-    await bot_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot de Telegram en línea y escuchando actualizaciones.")
+    for attempt in range(3):
+        try:
+            await bot_app.initialize()
+            await bot_app.start()
+            await setup_bot_commands(bot_app.bot)
+            await bot_app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Bot de Telegram en línea y escuchando actualizaciones.")
+            break
+        except Exception as e:
+            logger.warning(f"Intento {attempt + 1}/3 para iniciar el bot de Telegram falló: {e}. Reintentando en 3s...")
+            await asyncio.sleep(3)
 
     try:
         yield

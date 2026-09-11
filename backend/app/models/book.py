@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -21,6 +21,14 @@ class Book(Base):
     telegram_file_id = Column(String(255), nullable=True)
     file_unique_id = Column(String(100), index=True, nullable=True)
     file_format = Column(String(20), default="pdf")  # 'pdf' | 'epub' | 'mobi'
+    publication_year = Column(String(50), nullable=True)  # Año o fecha de salida original
+    series_name = Column(String(255), nullable=True)  # Nombre de la saga o trilogía
+    series_type = Column(String(50), nullable=True)  # 'Saga' | 'Trilogía' | 'Bilogía' | 'Serie' | 'Autoconclusivo'
+    series_order = Column(Integer, nullable=True)  # Orden o número del libro (ej: 1, 2)
+    series_total = Column(Integer, nullable=True)  # Total de libros en la saga si se conoce
+    previous_book = Column(String(255), nullable=True)  # Título del libro anterior
+    next_book = Column(String(255), nullable=True)  # Título del libro siguiente
+    has_sequel = Column(Boolean, nullable=True)  # True si tiene continuación, False si es libro final o autoconclusivo
     uploaded_at = Column(DateTime, default=utc_now)
     reading_progress = Column(Float, default=0.0)
 

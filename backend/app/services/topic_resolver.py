@@ -93,9 +93,21 @@ async def resolve_or_create_topic(
             genre=clean_genre,
             topic_id=topic_id
         )
-        session.add(new_topic)
-        await session.commit()
-        await session.refresh(new_topic)
+        try:
+            session.add(new_topic)
+            await session.commit()
+            await session.refresh(new_topic)
+        except Exception as commit_err:
+            await session.rollback()
+            logger.info(f"Topic '{clean_genre}' pudo haber sido insertado concurrentemente: {commit_err}. Reintentando búsqueda...")
+            stmt_retry = select(Topic).where(
+                Topic.telegram_link_id == telegram_link.id,
+                Topic.genre == clean_genre
+            )
+            retry_res = await session.execute(stmt_retry)
+            existing_retry = retry_res.scalar_one_or_none()
+            if existing_retry:
+                return existing_retry.topic_id
 
         logger.info(f"Topic creado exitosamente: '{topic_display_name}' -> thread {topic_id}")
         return topic_id

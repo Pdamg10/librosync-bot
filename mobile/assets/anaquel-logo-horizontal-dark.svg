@@ -1,0 +1,37 @@
+<svg viewBox="0 0 560 160" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGrad2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#22355e"/>
+      <stop offset="100%" stop-color="#141F38"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Ícono -->
+  <g transform="translate(0,0) scale(0.667)">
+    <rect x="0" y="0" width="240" height="240" rx="54" fill="url(#bgGrad2)"/>
+
+    <path d="M176,32 L212,45 L186,54 L191,74 L178,55 Z" fill="#6BB6FF"/>
+    <path d="M176,32 L191,74 L184,60 Z" fill="#4A93DB"/>
+
+    <path d="M120,72 C92,64 68,68 48,80 L48,160 C68,149 92,145 120,153 Z" fill="#F7F3EC"/>
+    <path d="M120,72 C148,64 172,68 192,80 L192,160 C172,149 148,145 120,153 Z" fill="#F7F3EC"/>
+
+    <line x1="120" y1="72" x2="120" y2="153" stroke="#141F38" stroke-width="2.5" opacity="0.35"/>
+
+    <line x1="60" y1="101" x2="100" y2="97" stroke="#1E2E52" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+    <line x1="60" y1="113" x2="98" y2="109" stroke="#1E2E52" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+    <line x1="60" y1="125" x2="95" y2="121" stroke="#1E2E52" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+
+    <line x1="140" y1="97" x2="180" y2="101" stroke="#1E2E52" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+    <line x1="142" y1="109" x2="180" y2="113" stroke="#1E2E52" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+    <line x1="145" y1="121" x2="180" y2="125" stroke="#1E2E52" stroke-width="3" stroke-linecap="round" opacity="0.25"/>
+
+    <rect x="190" y="86" width="16" height="9" rx="3.5" fill="#F0A868"/>
+    <rect x="190" y="105" width="16" height="9" rx="3.5" fill="#5FC9BF"/>
+    <rect x="190" y="124" width="16" height="9" rx="3.5" fill="#F2786F"/>
+  </g>
+
+  <!-- Wordmark for Dark Themes -->
+  <text x="182" y="78" font-family="'Poppins', 'Segoe UI', sans-serif" font-size="46" font-weight="700" fill="#F8FAFC">Anaquel</text>
+  <text x="183" y="104" font-family="'Segoe UI', sans-serif" font-size="16" letter-spacing="0.5" fill="#94A3B8">Cada libro en su estante, dentro de Telegram</text>
+</svg>

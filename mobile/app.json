@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "Anaquel",
+    "slug": "anaquel",
+    "version": "1.0.0",
+    "orientation": "default",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#141F38"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.anaquel.app"
+    },
+    "android": {
+      "package": "com.anaquel.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#141F38",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "cfd6ada7-06a2-40ac-ba6b-01f24c440898"
+      }
+    }
+  }
+}

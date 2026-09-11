@@ -1,6 +1,6 @@
 import os
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 
@@ -9,7 +9,7 @@ from app.models.book import Book
 from app.models.telegram_link import TelegramLink
 from app.schemas.book import BookOut, BookUpdate
 from app.bot.bot_instance import get_bot_application
-from app.services.telegram_service import send_book_document
+from app.services.telegram_service import send_book_document, get_telegram_file_bytes
 from app.services.topic_resolver import resolve_or_create_topic
 
 router = APIRouter(prefix="/library", tags=["Library"])
@@ -174,3 +174,45 @@ async def delete_book(book_id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(book)
     await db.commit()
     return {"message": "Libro eliminado"}
+
+
+@router.get("/{book_id}/file")
+async def download_book_file(book_id: int, db: AsyncSession = Depends(get_db)):
+    """Descarga el archivo del libro desde Telegram para el lector móvil."""
+    stmt = select(Book).where(Book.id == book_id)
+    res = await db.execute(stmt)
+    book = res.scalar_one_or_none()
+    if not book:
+        raise HTTPException(status_code=404, detail="Libro no encontrado")
+    if not book.telegram_file_id:
+        raise HTTPException(status_code=404, detail="El libro no cuenta con un archivo asociado en Telegram")
+
+    bot_app = get_bot_application()
+    try:
+        data, _ = await get_telegram_file_bytes(bot_app.bot, book.telegram_file_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error al descargar archivo desde Telegram: {e}")
+
+    media_type = "application/pdf" if (book.file_format or "").lower() == "pdf" else "application/epub+zip"
+    filename = f"{book.title}.{book.file_format or 'pdf'}"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@router.post("/sync")
+async def sync_library(telegram_link_id: int, db: AsyncSession = Depends(get_db)):
+    """Sincroniza y depura libros que hayan sido eliminados manualmente de Telegram."""
+    stmt = select(TelegramLink).where(TelegramLink.id == telegram_link_id)
+    res = await db.execute(stmt)
+    link = res.scalar_one_or_none()
+    if not link:
+        raise HTTPException(status_code=404, detail="Vínculo de Telegram no encontrado")
+
+    bot_app = get_bot_application()
+    from app.services.book_sync_service import sync_all_library_for_chat
+    result = await sync_all_library_for_chat(bot_app.bot, db, link.id, link.chat_id)
+    return result
+

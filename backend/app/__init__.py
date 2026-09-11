@@ -1,1 +1,2 @@
-# LibroSync backend package
+# Anaquel backend package
+import app.core.network_patch

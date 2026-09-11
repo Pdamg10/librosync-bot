@@ -49,7 +49,8 @@ async def send_book_document(
     document: Any,
     filename: Optional[str] = None,
     caption: Optional[str] = None,
-    topic_id: Optional[int] = None
+    topic_id: Optional[int] = None,
+    parse_mode: Optional[str] = "HTML"
 ) -> Any:
     kwargs: Dict[str, Any] = {
         "chat_id": chat_id,
@@ -60,6 +61,8 @@ async def send_book_document(
         kwargs["filename"] = filename
     if topic_id:
         kwargs["message_thread_id"] = topic_id
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
 
     try:
         return await bot.send_document(**kwargs)
@@ -121,3 +124,12 @@ async def move_or_repost_to_topic(
             logger.error(f"Error al reubicar mensaje {message_id} al topic {topic_id}: {e}")
             return None
     return None
+
+
+async def get_telegram_file_bytes(bot: Bot, file_id: str) -> tuple[bytes, str]:
+    """Descarga los bytes de un archivo desde los servidores de Telegram para servirlo a la app móvil."""
+    t_file = await bot.get_file(file_id)
+    out = bytearray()
+    await t_file.download_to_memory(out)
+    return bytes(out), t_file.file_path or ""
+

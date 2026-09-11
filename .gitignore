@@ -8,3 +8,6 @@ __pycache__/
 *.sqlite3
 storage/
 .DS_Store
+node_modules/
+.expo/
+*.apk

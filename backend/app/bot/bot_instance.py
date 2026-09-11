@@ -1,11 +1,19 @@
+import app.core.network_patch
+
 import logging
-from telegram import BotCommand
+from telegram import (
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     filters,
 )
 from app.core.config import settings
@@ -15,29 +23,56 @@ from app.bot.handlers import (
     set_topic_handler,
     catalog_handler,
     catalog_callback_handler,
+    search_handler,
+    search_callback_handler,
+    download_command_handler,
+    download_callback_handler,
     topics_list_handler,
     topic_index_handler,
     register_reply_handler,
+    rename_book_handler,
     help_handler,
+    chat_member_update_handler,
+    sync_handler,
+    info_handler,
+    buddy_read_handler,
+    my_books_handler,
+    progress_command_handler,
+    buddy_read_callback_handler,
+    reading_state_callback_handler,
+    deduplicate_command_handler,
+    lost_book_callback_handler,
 )
+
 
 logger = logging.getLogger(__name__)
 
 _bot_application: Application = None
 
 async def setup_bot_commands(bot):
-    """Registra el menú de comandos en Telegram para autocompletado nativo."""
+    """Registra el menú de comandos en Telegram para autocompletado nativo en chats privados, grupos y administradores."""
     try:
         commands = [
+            BotCommand("leerjuntos", "Iniciar o unirse a una lectura conjunta"),
+            BotCommand("mislibros", "Ver mis estantes: leyendo, favoritos, por leer"),
+            BotCommand("progreso", "Actualizar mi porcentaje de lectura actual"),
+            BotCommand("info", "Ficha de saga, continuación y co-lectores"),
             BotCommand("libros", "Ver catálogo de libros disponibles"),
+            BotCommand("buscar", "Buscar libros en la biblioteca actual"),
             BotCommand("temas", "Ver todos los temas y géneros"),
             BotCommand("indice", "Publicar índice de libros en este tema"),
+            BotCommand("descargar", "Buscar y descargar libros a la biblioteca"),
+            BotCommand("deduplicar", "Eliminar libros duplicados automáticamente"),
+            BotCommand("sincronizar", "Depurar libros eliminados y sincronizar biblioteca"),
             BotCommand("registrar", "Registrar un libro respondiendo a su mensaje"),
+            BotCommand("renombrar", "Corregir título o autor de un libro"),
             BotCommand("settopic", "Vincular este tema a un género"),
             BotCommand("help", "Mostrar ayuda y comandos disponibles"),
         ]
-        await bot.set_my_commands(commands)
-        logger.info("Menú de comandos de Telegram configurado con éxito.")
+        await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+        await bot.set_my_commands(commands, scope=BotCommandScopeAllChatAdministrators())
+        logger.info("Menú de comandos de Telegram configurado con éxito en todos los ámbitos.")
     except Exception as e:
         logger.warning(f"No se pudieron configurar los comandos de Telegram en BotFather: {e}")
 
@@ -47,25 +82,47 @@ def get_bot_application() -> Application:
         _bot_application = (
             ApplicationBuilder()
             .token(settings.TELEGRAM_BOT_TOKEN)
+            .connect_timeout(30.0)
+            .read_timeout(30.0)
+            .write_timeout(30.0)
+            .pool_timeout(30.0)
             .build()
         )
         # Registrar comandos
-        _bot_application.add_handler(CommandHandler("start", start_handler))
+        _bot_application.add_handler(CommandHandler(["start", "enlazar", "vincular"], start_handler))
         _bot_application.add_handler(CommandHandler("help", help_handler))
+        _bot_application.add_handler(CommandHandler(["leerjuntos", "conjunta", "buddyread"], buddy_read_handler))
+        _bot_application.add_handler(CommandHandler(["mislibros", "perfil", "estantes"], my_books_handler))
+        _bot_application.add_handler(CommandHandler(["progreso", "avance"], progress_command_handler))
+        _bot_application.add_handler(CommandHandler(["info", "detalle", "saga"], info_handler))
+        _bot_application.add_handler(CommandHandler(["descargar", "pedir", "download"], download_command_handler))
+        _bot_application.add_handler(CommandHandler(["buscar", "search", "encontrar"], search_handler))
         _bot_application.add_handler(CommandHandler("libros", catalog_handler))
         _bot_application.add_handler(CommandHandler("catalogo", catalog_handler))
         _bot_application.add_handler(CommandHandler("biblioteca", catalog_handler))
         _bot_application.add_handler(CommandHandler("temas", topics_list_handler))
         _bot_application.add_handler(CommandHandler("indice", topic_index_handler))
+        _bot_application.add_handler(CommandHandler(["deduplicar", "dedup"], deduplicate_command_handler))
+        _bot_application.add_handler(CommandHandler(["sincronizar", "limpiar", "sync"], sync_handler))
         _bot_application.add_handler(CommandHandler("registrar", register_reply_handler))
         _bot_application.add_handler(CommandHandler("indexar", register_reply_handler))
+        _bot_application.add_handler(CommandHandler(["renombrar", "editar"], rename_book_handler))
         _bot_application.add_handler(CommandHandler("settopic", set_topic_handler))
 
-        # Callback queries (paginación interactiva)
+        # Callback queries (paginación e interactividad)
         _bot_application.add_handler(CallbackQueryHandler(catalog_callback_handler, pattern="^catalog:"))
+        _bot_application.add_handler(CallbackQueryHandler(search_callback_handler, pattern="^search:"))
+        _bot_application.add_handler(CallbackQueryHandler(download_callback_handler, pattern="^dl:"))
+        _bot_application.add_handler(CallbackQueryHandler(buddy_read_callback_handler, pattern="^br:"))
+        _bot_application.add_handler(CallbackQueryHandler(reading_state_callback_handler, pattern="^rs:"))
+        _bot_application.add_handler(CallbackQueryHandler(lost_book_callback_handler, pattern="^rec:"))
 
         # Ingesta de libros
         _bot_application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
 
+        # Evento de unión o promoción del bot en grupos
+        _bot_application.add_handler(ChatMemberHandler(chat_member_update_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+
         logger.info("Todos los handlers del bot de Telegram registrados exitosamente.")
     return _bot_application
+
