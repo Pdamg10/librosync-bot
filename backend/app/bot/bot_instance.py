@@ -28,7 +28,9 @@ from app.bot.handlers import (
     download_command_handler,
     download_callback_handler,
     topics_list_handler,
+    topics_callback_handler,
     topic_index_handler,
+    topic_index_callback_handler,
     register_reply_handler,
     rename_book_handler,
     help_handler,
@@ -111,6 +113,8 @@ def get_bot_application() -> Application:
 
         # Callback queries (paginación e interactividad)
         _bot_application.add_handler(CallbackQueryHandler(catalog_callback_handler, pattern="^catalog:"))
+        _bot_application.add_handler(CallbackQueryHandler(topic_index_callback_handler, pattern="^tindex:"))
+        _bot_application.add_handler(CallbackQueryHandler(topics_callback_handler, pattern="^topics:"))
         _bot_application.add_handler(CallbackQueryHandler(search_callback_handler, pattern="^search:"))
         _bot_application.add_handler(CallbackQueryHandler(download_callback_handler, pattern="^dl:"))
         _bot_application.add_handler(CallbackQueryHandler(buddy_read_callback_handler, pattern="^br:"))

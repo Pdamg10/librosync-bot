@@ -134,6 +134,19 @@ async def process_book_message(
     suggested_emoji = classification.get("emoji", "📖")
     pub_year = classification.get("publication_year") or "Desconocido"
 
+    # Garantizar preservación de capítulos para Manga/Manhwa/Manhua
+    from app.services.ai_classifier import extract_manga_chapter_info, format_manga_title
+    chap_info = extract_manga_chapter_info(filename) or (extract_manga_chapter_info(effective_caption) if effective_caption else None)
+    if chap_info:
+        title = format_manga_title(title, filename)
+        if genre == "General":
+            genre = "Manga/Manhwa/Manhua"
+            suggested_emoji = get_genre_emoji(genre)
+        if author and (re.search(r'\d+\s*\]', author) or re.search(r'cap(?:itulo|s)?\.?', author, re.I)):
+            author = re.sub(r'^\d+\s*\]\s*', '', author).strip()
+            if not author or author.lower() in title.lower():
+                author = "Desconocido"
+
     # 4. Deduplicación Semántica (Título + Formato)
     title_slug = normalize_genre_slug(title)
     stmt_books = select(Book).where(Book.telegram_link_id == link.id)

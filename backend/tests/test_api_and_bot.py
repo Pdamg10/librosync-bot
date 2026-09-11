@@ -1309,12 +1309,14 @@ async def test_topic_index_chunking_large_topic(test_session, monkeypatch):
     mock_update.effective_message = mock_cmd_msg
 
     sent_messages = []
+    sent_keyboards = []
 
     async def mock_send_message(**kwargs):
         text = kwargs.get("text", "")
         # Validar límite estricto de Telegram
         assert len(text) <= 4096, f"Mensaje excede límite de Telegram ({len(text)} > 4096)"
         sent_messages.append(text)
+        sent_keyboards.append(kwargs.get("reply_markup"))
         return MagicMock()
 
     mock_bot = MagicMock()
@@ -1323,9 +1325,11 @@ async def test_topic_index_chunking_large_topic(test_session, monkeypatch):
 
     await topic_index_handler(mock_update, mock_context)
 
-    # Debe haberse enviado en al menos 2 fragmentos seguros
-    assert len(sent_messages) >= 2
-    assert any("Parte 2" in m for m in sent_messages)
+    # Ahora se envía un único mensaje paginado con botones inline interactivos para no saturar el grupo
+    assert len(sent_messages) == 1
+    assert "Página 1 de" in sent_messages[0]
+    assert "45 obras disponibles" in sent_messages[0]
+    assert sent_keyboards[0] is not None
 
 
 @pytest.mark.asyncio
@@ -1603,6 +1607,42 @@ async def test_deduplication_and_lost_book_sentinel(test_session, monkeypatch):
     # Verify 803 is deleted from DB
     b_deleted = (await test_session.execute(select(Book).where(Book.id == 803))).scalar_one_or_none()
     assert b_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_manga_chapter_packages_extraction_and_deduplication(test_session):
+    """Verifica que los paquetes de capítulos de Manga/Manhwa conserven su rango y no se consideren duplicados erróneamente."""
+    from app.services.ai_classifier import extract_manga_chapter_info, format_manga_title, fallback_parse_filename
+    from app.services.topic_resolver import normalize_genre_slug
+
+    # 1. Extracción de capítulos
+    assert extract_manga_chapter_info("Solo Leveling 171-179.pdf") == "Cap. 171-179"
+    assert extract_manga_chapter_info("[161-170] Solo Leveling.pdf") == "Cap. 161-170"
+    assert extract_manga_chapter_info("Solo Leveling - Cap. 1-10.pdf") == "Cap. 1-10"
+    assert extract_manga_chapter_info("Solo Leveling Tomo 3.pdf") == "Tomo 3"
+    assert extract_manga_chapter_info("Cien Anos de Soledad.epub") is None
+
+    # 2. Formateo de títulos
+    t1 = format_manga_title("Solo Leveling", "Solo Leveling 171-179.pdf")
+    t2 = format_manga_title("[161", "[161-170] Solo Leveling.pdf")
+    assert "171-179" in t1
+    assert "161-170" in t2
+    assert "Solo Leveling" in t2
+
+    # 3. Slugs diferentes para evitar falsos positivos de duplicado
+    s1 = normalize_genre_slug(t1)
+    s2 = normalize_genre_slug(t2)
+    assert s1 != s2, f"Slugs colisionan: {s1} == {s2}"
+
+    # 4. Fallback parser reconoce el paquete de capítulos
+    meta1 = fallback_parse_filename("Solo Leveling 171-179.pdf")
+    meta2 = fallback_parse_filename("[161-170] Solo Leveling.pdf")
+    assert meta1["genre"] == "Manga/Manhwa/Manhua"
+    assert meta2["genre"] == "Manga/Manhwa/Manhua"
+    assert "171-179" in meta1["title"]
+    assert "161-170" in meta2["title"]
+    assert meta2["author"] != "170] Solo Leveling"
+
 
 
 

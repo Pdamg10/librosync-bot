@@ -500,7 +500,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-def build_catalog_page(chat_id: int, books: List[Book], page: int = 1, per_page: int = 5) -> tuple[str, InlineKeyboardMarkup]:
+def build_catalog_page(chat_id: int, books: List[Book], page: int = 1, per_page: int = 5, topic_id: Optional[int] = None, genre_name: Optional[str] = None) -> tuple[str, InlineKeyboardMarkup]:
     """Genera el texto y la botonera de paginación del catálogo de libros con formato HTML seguro."""
     import html
     from app.services.ai_classifier import get_genre_emoji
@@ -513,8 +513,14 @@ def build_catalog_page(chat_id: int, books: List[Book], page: int = 1, per_page:
     end_idx = start_idx + per_page
     page_books = books[start_idx:end_idx]
 
+    if genre_name:
+        emo = get_genre_emoji(genre_name)
+        header_title = f"📚 <b>Catálogo: {emo} {html.escape(genre_name)}</b>"
+    else:
+        header_title = "📚 <b>Catálogo de Libros Disponibles</b>"
+
     lines = [
-        "📚 <b>Catálogo de Libros Disponibles</b>",
+        header_title,
         f"<i>(Página {page} de {total_pages} — {total_books} libros registrados)</i>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
@@ -546,12 +552,13 @@ def build_catalog_page(chat_id: int, books: List[Book], page: int = 1, per_page:
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     # Botones de paginación
+    prefix = f"catalog:t:{topic_id}:" if topic_id else "catalog:page:"
     nav_buttons = []
     if page > 1:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"catalog:page:{page - 1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"{prefix}{page - 1}"))
     nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="catalog:noop"))
     if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"catalog:page:{page + 1}"))
+        nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"{prefix}{page + 1}"))
 
     keyboard = InlineKeyboardMarkup([nav_buttons]) if total_pages > 1 else InlineKeyboardMarkup([[]])
     return "\n".join(lines), keyboard
@@ -562,6 +569,8 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Comando /libros o /catalogo:
     Muestra la lista paginada de libros disponibles con título, autor, fecha, género y enlace directo.
     Funciona tanto en el tema General como dentro de cualquier tema o en chats privados.
+    Si se ejecuta dentro de un tema específico, muestra los libros de ese tema.
+    Para ver la biblioteca completa desde un tema: /libros todos.
     """
     message = update.effective_message
     chat = update.effective_chat
@@ -581,28 +590,44 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Comprobar si se pide ver toda la biblioteca explícitamente o si estamos en un tema particular
+        arg_all = context.args and any("todo" in a.lower() for a in context.args)
+        topic_filter = None
+        topic_id_val = None
+        if thread_id and not arg_all:
+            stmt_t = select(Topic).where(Topic.telegram_link_id == link.id, Topic.topic_id == thread_id)
+            t_res = await session.execute(stmt_t)
+            topic_obj = t_res.scalar_one_or_none()
+            if topic_obj:
+                topic_filter = topic_obj.genre
+                topic_id_val = thread_id
+
         # Consultar libros (en privado consulta los del usuario, en grupo los del grupo)
         if chat.type == "private":
             stmt_books = (
                 select(Book)
                 .options(selectinload(Book.telegram_link))
                 .where(Book.user_id == link.user_id)
-                .order_by(Book.uploaded_at.desc())
             )
         else:
             stmt_books = (
                 select(Book)
                 .options(selectinload(Book.telegram_link))
                 .where(Book.telegram_link_id == link.id)
-                .order_by(Book.uploaded_at.desc())
             )
+
+        if topic_filter:
+            stmt_books = stmt_books.where(Book.genre == topic_filter)
+
+        stmt_books = stmt_books.order_by(Book.uploaded_at.desc())
         b_res = await session.execute(stmt_books)
         books = b_res.scalars().all()
 
         if not books:
             empty_text = (
-                "📚 <b>La biblioteca aún está vacía.</b>\n\n"
-                "Sube libros en formato PDF o EPUB al chat o a cualquier tema para empezar a armar el catálogo."
+                f"📚 <b>No hay libros en '{topic_filter}'.</b>\n\nSube libros a este tema para verlos aquí."
+                if topic_filter else
+                "📚 <b>La biblioteca aún está vacía.</b>\n\nSube libros en formato PDF o EPUB al chat o a cualquier tema para empezar a armar el catálogo."
             )
             try:
                 await context.bot.send_message(
@@ -619,7 +644,7 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        text, keyboard = build_catalog_page(chat.id, books, page=1)
+        text, keyboard = build_catalog_page(chat.id, books, page=1, topic_id=topic_id_val, genre_name=topic_filter)
         try:
             await context.bot.send_message(
                 chat_id=chat.id,
@@ -640,7 +665,7 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def catalog_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los clics de paginación de /libros sin bloquearse."""
+    """Maneja los clics de paginación de /libros sin saturar el chat."""
     query = update.callback_query
     if not query or not query.data:
         return
@@ -654,44 +679,65 @@ async def catalog_callback_handler(update: Update, context: ContextTypes.DEFAULT
     if data == "catalog:noop":
         return
 
-    if data.startswith("catalog:page:"):
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    topic_id_val = None
+    topic_filter = None
+    page_num = 1
+
+    if data.startswith("catalog:t:"):
+        parts = data.split(":")
+        topic_id_val = int(parts[2])
+        page_num = int(parts[3])
+    elif data.startswith("catalog:page:"):
         page_num = int(data.split(":")[-1])
-        chat = update.effective_chat
-        if not chat:
+    else:
+        return
+
+    async with AsyncSessionLocal() as session:
+        link = await _get_or_create_link(context.bot, session, chat.id)
+        if not link:
             return
 
-        async with AsyncSessionLocal() as session:
-            link = await _get_or_create_link(context.bot, session, chat.id)
-            if not link:
-                return
+        if topic_id_val:
+            stmt_t = select(Topic).where(Topic.telegram_link_id == link.id, Topic.topic_id == topic_id_val)
+            t_res = await session.execute(stmt_t)
+            topic_obj = t_res.scalar_one_or_none()
+            if topic_obj:
+                topic_filter = topic_obj.genre
 
-            if chat.type == "private":
-                stmt_books = (
-                    select(Book)
-                    .options(selectinload(Book.telegram_link))
-                    .where(Book.user_id == link.user_id)
-                    .order_by(Book.uploaded_at.desc())
-                )
-            else:
-                stmt_books = (
-                    select(Book)
-                    .options(selectinload(Book.telegram_link))
-                    .where(Book.telegram_link_id == link.id)
-                    .order_by(Book.uploaded_at.desc())
-                )
-            b_res = await session.execute(stmt_books)
-            books = b_res.scalars().all()
+        if chat.type == "private":
+            stmt_books = (
+                select(Book)
+                .options(selectinload(Book.telegram_link))
+                .where(Book.user_id == link.user_id)
+            )
+        else:
+            stmt_books = (
+                select(Book)
+                .options(selectinload(Book.telegram_link))
+                .where(Book.telegram_link_id == link.id)
+            )
 
-            text, keyboard = build_catalog_page(chat.id, books, page=page_num)
-            try:
-                await query.edit_message_text(
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-            except Exception as edit_err:
-                logger.error(f"Error editando mensaje de catálogo en página {page_num}: {edit_err}")
+        if topic_filter:
+            stmt_books = stmt_books.where(Book.genre == topic_filter)
+
+        stmt_books = stmt_books.order_by(Book.uploaded_at.desc())
+        b_res = await session.execute(stmt_books)
+        books = b_res.scalars().all()
+
+        text, keyboard = build_catalog_page(chat.id, books, page=page_num, topic_id=topic_id_val, genre_name=topic_filter)
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception as edit_err:
+            logger.error(f"Error editando mensaje de catálogo en página {page_num}: {edit_err}")
 
 
 _search_query_cache: Dict[str, Tuple[str, float]] = {}  # token -> (query_text, timestamp)
@@ -1287,13 +1333,6 @@ async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
 
-        header = (
-            "🏷️ <b>Temas y Géneros Disponibles en Anaquel</b>\n"
-            f"<i>(Total: {len(topics) if topics else len(counts)} estantes registrados)</i>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        )
-        footer = "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n💡 <i>Pulsa sobre cualquier tema para entrar directamente a él.</i>"
-
         topic_lines = []
         if topics:
             for t in topics:
@@ -1311,47 +1350,249 @@ async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 genre_safe = html.escape(genre_name)
                 topic_lines.append(f'• {emo} <b>{genre_safe}</b> — <code>{qty} libro(s)</code>')
 
-        # Chunking para respetar el límite de 4096 caracteres de Telegram
-        chunks = []
-        cur_chunk = [header]
-        cur_len = len(header) + len(footer)
-        for t_line in topic_lines:
-            if cur_len + len(t_line) + 1 > 3800:
-                cur_chunk.append(footer)
-                chunks.append("\n".join(cur_chunk))
-                cur_chunk = [header, t_line]
-                cur_len = len(header) + len(t_line) + len(footer)
-            else:
-                cur_chunk.append(t_line)
-                cur_len += len(t_line) + 1
-        if cur_chunk:
-            cur_chunk.append(footer)
-            chunks.append("\n".join(cur_chunk))
+        text, keyboard = build_topics_page(chat.id, topic_lines, len(topics) if topics else len(counts), page=1)
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=thread_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
 
-        for chunk_text in chunks:
+
+def build_topics_page(
+    chat_id: int,
+    topic_lines: List[str],
+    total_topics: int,
+    page: int = 1,
+    per_page: int = 10
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Genera la página del catálogo de temas con paginación interactiva."""
+    total_pages = max(1, (len(topic_lines) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    page_items = topic_lines[start_idx:end_idx]
+
+    lines = [
+        "🏷️ <b>Temas y Géneros Disponibles en Anaquel</b>",
+        f"<i>(Página {page} de {total_pages} — {total_topics} estantes registrados)</i>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ]
+    lines.extend(page_items)
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 <i>Pulsa sobre cualquier tema para entrar directamente a él.</i>")
+
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"topics:page:{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="topics:noop"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"topics:page:{page + 1}"))
+
+    keyboard = InlineKeyboardMarkup([nav_buttons]) if total_pages > 1 else InlineKeyboardMarkup([[]])
+    return "\n".join(lines), keyboard
+
+
+async def topics_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paginación interactiva de la lista de temas sin reenviar mensajes."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if query.data == "topics:noop":
+        return
+    if not query.data.startswith("topics:page:"):
+        return
+
+    page_num = int(query.data.split(":")[-1])
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    import html
+    from app.services.ai_classifier import get_genre_emoji
+
+    async with AsyncSessionLocal() as session:
+        link = await _get_or_create_link(context.bot, session, chat.id)
+        if not link:
+            return
+
+        stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id).order_by(Topic.genre.asc())
+        t_res = await session.execute(stmt_topics)
+        topics = t_res.scalars().all()
+
+        if chat.type == "private":
+            stmt_books = select(Book).where(Book.user_id == link.user_id)
+        else:
+            stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        b_res = await session.execute(stmt_books)
+        all_books = b_res.scalars().all()
+
+        counts = {}
+        for b in all_books:
+            counts[b.genre] = counts.get(b.genre, 0) + 1
+
+        clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
+        topic_lines = []
+        if topics:
+            for t in topics:
+                emo = get_genre_emoji(t.genre)
+                qty = counts.get(t.genre, 0)
+                genre_safe = html.escape(t.genre)
+                if str(chat.id).startswith("-100"):
+                    topic_link = f"https://t.me/c/{clean_chat_id}/{t.topic_id}"
+                    topic_lines.append(f'• {emo} <a href="{topic_link}"><b>{genre_safe}</b></a> — <code>{qty} libro(s)</code>')
+                else:
+                    topic_lines.append(f'• {emo} <b>{genre_safe}</b> — <code>{qty} libro(s)</code>')
+        else:
+            for genre_name, qty in sorted(counts.items(), key=lambda x: x[0]):
+                emo = get_genre_emoji(genre_name)
+                genre_safe = html.escape(genre_name)
+                topic_lines.append(f'• {emo} <b>{genre_safe}</b> — <code>{qty} libro(s)</code>')
+
+        text, keyboard = build_topics_page(chat.id, topic_lines, len(topics) if topics else len(counts), page=page_num)
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception as edit_err:
+            logger.error(f"Error editando lista de temas página {page_num}: {edit_err}")
+
+
+def build_topic_index_page(
+    chat_id: int,
+    thread_id: int,
+    genre_name: str,
+    books: List[Book],
+    page: int = 1,
+    per_page: int = 10
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Genera el texto y la botonera de paginación del índice de un tema para no saturar el grupo."""
+    import html
+    from app.services.ai_classifier import get_genre_emoji
+
+    total_books = len(books)
+    total_pages = max(1, (total_books + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    page_books = books[start_idx:end_idx]
+
+    emo = get_genre_emoji(genre_name)
+    lines = [
+        f"📌 <b>ÍNDICE DE LA COLECCIÓN: {emo} {html.escape(genre_name)}</b>",
+        f"<i>(Página {page} de {total_pages} — {total_books} obras disponibles)</i>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ]
+
+    clean_chat_id = str(chat_id).replace("-100", "").replace("-", "")
+
+    for i, b in enumerate(page_books, start=start_idx + 1):
+        fmt = (b.file_format or "pdf").upper()
+        book_chat = chat_id
+        if getattr(b, "telegram_link", None) and getattr(b.telegram_link, "chat_id", None):
+            book_chat = b.telegram_link.chat_id
+        b_clean = str(book_chat).replace("-100", "").replace("-", "")
+        msg_link = f"https://t.me/c/{b_clean}/{b.telegram_message_id}" if b.telegram_message_id and str(book_chat).startswith("-100") else None
+        link_html = f'<a href="{msg_link}">👉 Ver libro</a>' if msg_link else ""
+        title_safe = html.escape(b.title or "Sin título")
+        author_safe = html.escape(b.author or "Desconocido")
+        pub_yr = f" ({b.publication_year})" if b.publication_year and b.publication_year != "Desconocido" else ""
+        lines.append(f"<b>{i}.</b> 📖 <b>{title_safe}</b>{pub_yr} — <i>{author_safe}</i> (<code>.{fmt}</code>) {link_html}")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 <i>Navega con los botones para ver toda la colección sin saturar el grupo.</i>")
+
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"tindex:p:{thread_id}:{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="tindex:noop"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"tindex:p:{thread_id}:{page + 1}"))
+
+    keyboard = InlineKeyboardMarkup([nav_buttons]) if total_pages > 1 else InlineKeyboardMarkup([[]])
+    return "\n".join(lines), keyboard
+
+
+async def topic_index_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja la paginación del índice de un tema mediante edición del mensaje original."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if query.data == "tindex:noop":
+        return
+
+    parts = query.data.split(":")
+    if len(parts) >= 4 and parts[1] == "p":
+        thread_id = int(parts[2])
+        page_num = int(parts[3])
+        chat = update.effective_chat
+        if not chat:
+            return
+
+        async with AsyncSessionLocal() as session:
+            link = await _get_or_create_link(context.bot, session, chat.id)
+            if not link:
+                return
+
+            stmt_topic = select(Topic).where(
+                Topic.telegram_link_id == link.id,
+                Topic.topic_id == thread_id
+            )
+            t_res = await session.execute(stmt_topic)
+            topic = t_res.scalar_one_or_none()
+            genre_name = topic.genre if topic else "General"
+
+            stmt_books = (
+                select(Book)
+                .options(selectinload(Book.telegram_link))
+                .where(Book.telegram_link_id == link.id, Book.genre == genre_name)
+                .order_by(Book.title.asc())
+            )
+            b_res = await session.execute(stmt_books)
+            books = b_res.scalars().all()
+
+            text, keyboard = build_topic_index_page(chat.id, thread_id, genre_name, books, page=page_num)
             try:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    message_thread_id=thread_id,
-                    text=chunk_text,
+                await query.edit_message_text(
+                    text=text,
+                    reply_markup=keyboard,
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=chunk_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
+            except Exception as e:
+                logger.error(f"Error editando página de índice {page_num}: {e}")
 
 
 async def topic_index_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Comando /indice:
-    Debe ejecutarse DENTRO de un tema. Publica un mensaje índice formateado con todos
-    los libros disponibles en este tema específico, con enlaces directos para fijar.
-    Soporta temas grandes fragmentando mensajes sin exceder el límite de Telegram.
+    Debe ejecutarse DENTRO de un tema. Publica un mensaje índice paginado interactivamente
+    con los libros disponibles en este tema específico, con enlaces directos para navegar sin saturar el chat.
     """
     message = update.effective_message
     chat = update.effective_chat
@@ -1403,17 +1644,13 @@ async def topic_index_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         b_res = await session.execute(stmt_books)
         books = b_res.scalars().all()
 
-        clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
-
-        header = (
-            f"📌 <b>ÍNDICE DE LA COLECCIÓN: {emo} {html.escape(genre_name)}</b>\n"
-            f"<i>(Total: {len(books)} libros disponibles)</i>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        )
-        footer = "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n💡 <i>Tip para Administradores: Fija este mensaje en el tema para que los lectores lo vean al entrar.</i>"
-
         if not books:
-            empty_index = header + "<i>(Aún no hay libros archivados en este tema)</i>\n" + footer
+            empty_index = (
+                f"📌 <b>ÍNDICE DE LA COLECCIÓN: {emo} {html.escape(genre_name)}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>(Aún no hay libros archivados en este tema)</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
             try:
                 await context.bot.send_message(
                     chat_id=chat.id,
@@ -1431,57 +1668,24 @@ async def topic_index_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             return
 
-        book_lines = []
-        for i, b in enumerate(books, start=1):
-            fmt = (b.file_format or "pdf").upper()
-            book_chat = chat.id
-            if getattr(b, "telegram_link", None) and getattr(b.telegram_link, "chat_id", None):
-                book_chat = b.telegram_link.chat_id
-            b_clean = str(book_chat).replace("-100", "").replace("-", "")
-            msg_link = f"https://t.me/c/{b_clean}/{b.telegram_message_id}" if b.telegram_message_id and str(book_chat).startswith("-100") else None
-            link_html = f'<a href="{msg_link}">👉 Ver libro</a>' if msg_link else ""
-            title_safe = html.escape(b.title or "Sin título")
-            author_safe = html.escape(b.author or "Desconocido")
-            pub_yr = f" ({b.publication_year})" if b.publication_year and b.publication_year != "Desconocido" else ""
-            book_lines.append(f"<b>{i}.</b> 📖 <b>{title_safe}</b>{pub_yr} — <i>{author_safe}</i> (<code>.{fmt}</code>) {link_html}")
-
-        # Fragmentación segura en bloques de < 3800 caracteres
-        chunks = []
-        cur_chunk = [header]
-        cur_len = len(header) + len(footer)
-        part = 1
-        for b_line in book_lines:
-            if cur_len + len(b_line) + 1 > 3800:
-                cur_chunk.append(footer)
-                chunks.append("\n".join(cur_chunk))
-                part += 1
-                part_hdr = f"📌 <b>ÍNDICE DE LA COLECCIÓN (Parte {part}): {emo} {html.escape(genre_name)}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                cur_chunk = [part_hdr, b_line]
-                cur_len = len(part_hdr) + len(b_line) + len(footer)
-            else:
-                cur_chunk.append(b_line)
-                cur_len += len(b_line) + 1
-
-        if cur_chunk:
-            cur_chunk.append(footer)
-            chunks.append("\n".join(cur_chunk))
-
-        for text_chunk in chunks:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    message_thread_id=thread_id,
-                    text=text_chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=text_chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
+        text, keyboard = build_topic_index_page(chat.id, thread_id, genre_name, books, page=1)
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=thread_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
 
 
 async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
