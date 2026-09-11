@@ -2,7 +2,7 @@
   "expo": {
     "name": "Anaquel",
     "slug": "anaquel",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -17,6 +17,7 @@
     },
     "android": {
       "package": "com.anaquel.app",
+      "versionCode": 2,
       "adaptiveIcon": {
         "backgroundColor": "#141F38",
         "foregroundImage": "./assets/android-icon-foreground.png",
