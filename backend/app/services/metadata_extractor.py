@@ -4,7 +4,10 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, Any, Optional
-import pypdf
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
 
 logger = logging.getLogger(__name__)
 
@@ -108,48 +111,51 @@ def extract_internal_book_metadata(file_bytes: bytes, file_format: str) -> Dict[
             logger.warning(f"Error extrayendo metadatos EPUB: {e}")
 
     elif fmt == "pdf":
-        try:
-            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-            meta = reader.metadata
-            if meta:
-                if getattr(meta, "title", None) and str(meta.title).strip():
-                    result["internal_title"] = str(meta.title).strip()
-                if getattr(meta, "author", None) and str(meta.author).strip():
-                    result["internal_author"] = str(meta.author).strip()
-                if getattr(meta, "subject", None) and str(meta.subject).strip():
-                    result["internal_genre"] = str(meta.subject).strip()
-                for d_attr in ["creation_date", "modification_date"]:
-                    val = getattr(meta, d_attr, None)
-                    if val:
-                        m_d = re.search(r"\b(1[89]\d{2}|20\d{2})\b", str(val))
-                        if m_d:
-                            result["internal_date"] = m_d.group(1)
-                            break
+        if pypdf is None:
+            logger.warning("pypdf no está disponible; omitiendo metadatos internos de PDF")
+        else:
+            try:
+                reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                meta = reader.metadata
+                if meta:
+                    if getattr(meta, "title", None) and str(meta.title).strip():
+                        result["internal_title"] = str(meta.title).strip()
+                    if getattr(meta, "author", None) and str(meta.author).strip():
+                        result["internal_author"] = str(meta.author).strip()
+                    if getattr(meta, "subject", None) and str(meta.subject).strip():
+                        result["internal_genre"] = str(meta.subject).strip()
+                    for d_attr in ["creation_date", "modification_date"]:
+                        val = getattr(meta, d_attr, None)
+                        if val:
+                            m_d = re.search(r"\b(1[89]\d{2}|20\d{2})\b", str(val))
+                            if m_d:
+                                result["internal_date"] = m_d.group(1)
+                                break
 
-            # Extraer texto de las primeras 3 páginas (portada, créditos, dedicatoria)
-            snippet_parts = []
-            for p in reader.pages[:3]:
-                try:
-                    txt = p.extract_text() or ""
-                    clean = re.sub(r"\s+", " ", txt).strip()
-                    if clean:
-                        snippet_parts.append(clean)
-                except Exception:
-                    continue
+                # Extraer texto de las primeras 3 páginas (portada, créditos, dedicatoria)
+                snippet_parts = []
+                for p in reader.pages[:3]:
+                    try:
+                        txt = p.extract_text() or ""
+                        clean = re.sub(r"\s+", " ", txt).strip()
+                        if clean:
+                            snippet_parts.append(clean)
+                    except Exception:
+                        continue
 
-            if snippet_parts:
-                full_text = " --- ".join(snippet_parts)
-                result["text_snippet"] = full_text[:800]
-                if not result.get("internal_date"):
-                    m_c = re.search(
-                        r"(?:©|copyright|\(c\)|primera\s+edici[oó]n|publicad[oa]\s+en|año\s+de\s+publicaci[oó]n)\s*[:.]?\s*(?:de\s*)?(1[89]\d{2}|20\d{2})\b",
-                        full_text,
-                        re.IGNORECASE
-                    )
-                    if m_c:
-                        result["internal_date"] = m_c.group(1)
+                if snippet_parts:
+                    full_text = " --- ".join(snippet_parts)
+                    result["text_snippet"] = full_text[:800]
+                    if not result.get("internal_date"):
+                        m_c = re.search(
+                            r"(?:©|copyright|\(c\)|primera\s+edici[oó]n|publicad[oa]\s+en|año\s+de\s+publicaci[oó]n)\s*[:.]?\s*(?:de\s*)?(1[89]\d{2}|20\d{2})\b",
+                            full_text,
+                            re.IGNORECASE
+                        )
+                        if m_c:
+                            result["internal_date"] = m_c.group(1)
 
-        except Exception as e:
-            logger.warning(f"Error extrayendo metadatos PDF: {e}")
+            except Exception as e:
+                logger.warning(f"Error extrayendo metadatos PDF: {e}")
 
     return result
