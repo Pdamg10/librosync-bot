@@ -5,6 +5,10 @@ __pycache__/
 *.pyd
 .env
 *.db
+!librosync.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite3
 storage/
 .DS_Store

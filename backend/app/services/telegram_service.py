@@ -126,10 +126,12 @@ async def move_or_repost_to_topic(
     return None
 
 
+import io
+
 async def get_telegram_file_bytes(bot: Bot, file_id: str) -> tuple[bytes, str]:
     """Descarga los bytes de un archivo desde los servidores de Telegram para servirlo a la app móvil."""
     t_file = await bot.get_file(file_id)
-    out = bytearray()
-    await t_file.download_to_memory(out)
-    return bytes(out), t_file.file_path or ""
+    buf = io.BytesIO()
+    await t_file.download_to_memory(buf)
+    return buf.getvalue(), t_file.file_path or ""
 

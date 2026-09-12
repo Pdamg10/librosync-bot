@@ -44,6 +44,8 @@ from app.bot.handlers import (
     reading_state_callback_handler,
     deduplicate_command_handler,
     lost_book_callback_handler,
+    setup_mode_callback_handler,
+    code_exp_callback_handler,
 )
 
 
@@ -120,6 +122,8 @@ def get_bot_application() -> Application:
         _bot_application.add_handler(CallbackQueryHandler(buddy_read_callback_handler, pattern="^br:"))
         _bot_application.add_handler(CallbackQueryHandler(reading_state_callback_handler, pattern="^rs:"))
         _bot_application.add_handler(CallbackQueryHandler(lost_book_callback_handler, pattern="^rec:"))
+        _bot_application.add_handler(CallbackQueryHandler(setup_mode_callback_handler, pattern="^setup_mode:"))
+        _bot_application.add_handler(CallbackQueryHandler(code_exp_callback_handler, pattern="^code_exp:"))
 
         # Ingesta de libros
         _bot_application.add_handler(MessageHandler(filters.Document.ALL, document_handler))

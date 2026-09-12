@@ -1,7 +1,9 @@
 import logging
 import re
 import html
-from datetime import datetime, timezone
+import secrets
+import string
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -39,28 +41,46 @@ def clean_filename(filename: str) -> tuple[str, str]:
     return filename, "unknown"
 
 
-async def _get_or_create_link(bot, session, chat_id: int) -> Optional[TelegramLink]:
-    """Obtiene el vínculo existente para un chat o lo auto-vincula de forma transparente."""
+async def _get_or_create_link(bot, session, chat_id: int, effective_user=None) -> Optional[TelegramLink]:
+    """
+    Obtiene el vínculo existente para un chat.
+    En chat privado (chat_id > 0), auto-inicializa la biblioteca personal si no existe.
+    En grupos (chat_id < 0), solo retorna el vínculo si el grupo fue vinculado previamente con un código válido.
+    """
     stmt = select(TelegramLink).where(TelegramLink.chat_id == chat_id)
     res = await session.execute(stmt)
     link = res.scalar_one_or_none()
     if not link:
-        try:
-            status_info = await get_chat_and_bot_status(bot, chat_id)
-            chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
+        if chat_id > 0:
+            # Chat privado: auto-vincular como biblioteca personal
+            tg_user_id = effective_user.id if effective_user else chat_id
+            stmt_u = select(User).where(User.telegram_user_id == tg_user_id)
+            user_res = await session.execute(stmt_u)
+            user = user_res.scalar_one_or_none()
+            if not user:
+                user_name = (
+                    effective_user.full_name or effective_user.first_name
+                    if effective_user else "Usuario Personal"
+                )
+                user = User(telegram_user_id=tg_user_id, nombre=user_name)
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+
             link = TelegramLink(
-                user_id=1,
+                user_id=user.id,
                 chat_id=chat_id,
-                chat_type=chat_type_str,
-                chat_title=status_info["chat_title"],
-                bot_is_admin=status_info["bot_is_admin"],
-                forum_enabled=status_info["forum_enabled"]
+                chat_type="private",
+                chat_title=f"Biblioteca Personal ({user.nombre})",
+                bot_is_admin=True,
+                forum_enabled=False
             )
             session.add(link)
             await session.commit()
             await session.refresh(link)
-        except Exception as err:
-            logger.warning(f"No se pudo auto-vincular chat {chat_id}: {err}")
+            return link
+        else:
+            # Grupo no vinculado: NO auto-vincular a ciegas sin código
             return None
     return link
 
@@ -68,93 +88,111 @@ async def _get_or_create_link(bot, session, chat_id: int) -> Optional[TelegramLi
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Maneja el comando /start [codigo_vinculacion]
-    Permite vincular grupos, canales o chats privados con la cuenta de LibroSync.
+    Permite configurar el bot para Biblioteca Personal o vincular una Biblioteca de Grupo con código único.
     """
     message = update.effective_message
     chat = update.effective_chat
+    tg_user = update.effective_user
 
     if not message or not chat:
         return
 
     args = context.args
+    bot = context.bot
+
+    # Caso 1: /start sin argumentos
     if not args:
         if chat.type == "private":
-            await message.reply_text(
-                "👋 <b>¡Hola! Soy el asistente de LibroSync / Anaquel.</b>\n\n"
-                "Para sincronizar tu biblioteca con Telegram:\n"
-                "1. Añádeme a tu grupo (con <b>Temas/Topics</b> activados) o canal.\n"
-                "2. Hazme administrador con permiso de <b>'Administrar temas'</b>.\n"
-                "3. En la app móvil, pulsa en <b>'Vincular Telegram'</b> y usa el enlace proporcionado.",
-                parse_mode="HTML"
+            user_name = html.escape(tg_user.first_name if tg_user else "lector")
+            keyboard = [
+                [InlineKeyboardButton("👤 Biblioteca Personal", callback_data="setup_mode:personal")],
+                [InlineKeyboardButton("👥 Biblioteca de Grupo", callback_data="setup_mode:group")],
+            ]
+            welcome_text = (
+                f"👋 <b>¡Hola, {user_name}! Soy Griffin, tu bibliotecario digital inteligente.</b>\n\n"
+                "📚 ¿Cómo deseas utilizarme hoy?\n\n"
+                "1️⃣ <b>Biblioteca Personal:</b>\n"
+                "Guarda, organiza y consulta tus libros directamente en este chat privado. Envíame cualquier PDF o EPUB y armaré tu catálogo personal.\n\n"
+                "2️⃣ <b>Biblioteca de Grupo:</b>\n"
+                "Organiza la biblioteca de tu club de lectura o comunidad en un grupo con <b>Temas/Topics</b>. Generaremos un <b>código único de vinculación</b> con la vigencia que tú elijas.\n\n"
+                "👇 <i>Selecciona una opción para comenzar:</i>"
             )
+            await message.reply_text(welcome_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
         else:
-            # En grupo/canal: vincular automáticamente a la cuenta principal del bot (user_id=1)
-            bot = context.bot
-            try:
-                status_info = await get_chat_and_bot_status(bot, chat.id)
-            except Exception as e:
-                await message.reply_text(f"❌ Error al consultar información del chat: {html.escape(str(e))}", parse_mode="HTML")
-                return
-
-            chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
+            # En grupo / supergrupo sin argumentos
             async with AsyncSessionLocal() as session:
                 stmt_link = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
                 res_link = await session.execute(stmt_link)
                 existing_link = res_link.scalar_one_or_none()
 
                 if existing_link:
-                    existing_link.user_id = 1
-                    existing_link.chat_type = chat_type_str
-                    existing_link.chat_title = status_info["chat_title"]
-                    existing_link.bot_is_admin = status_info["bot_is_admin"]
-                    existing_link.forum_enabled = status_info["forum_enabled"]
-                    existing_link.linked_at = datetime.now(timezone.utc)
-                else:
-                    new_link = TelegramLink(
-                        user_id=1,
-                        chat_id=chat.id,
-                        chat_type=chat_type_str,
-                        chat_title=status_info["chat_title"],
-                        bot_is_admin=status_info["bot_is_admin"],
-                        forum_enabled=status_info["forum_enabled"]
+                    stmt_count = select(Book).where(Book.telegram_link_id == existing_link.id)
+                    res_count = await session.execute(stmt_count)
+                    total_books = len(res_count.scalars().all())
+
+                    stmt_topics = select(Topic).where(Topic.telegram_link_id == existing_link.id)
+                    res_topics = await session.execute(stmt_topics)
+                    total_topics = len(res_topics.scalars().all())
+
+                    safe_title = html.escape(existing_link.chat_title or chat.title or "Grupo")
+                    msg = (
+                        f"📚 <b>Biblioteca Activa: '{safe_title}'</b>\n\n"
+                        f"• <b>Libros registrados en este grupo:</b> {total_books}\n"
+                        f"• <b>Temas/Estantes configurados:</b> {total_topics}\n"
+                        f"• <b>Aislamiento de datos:</b> ✅ 100% independiente y protegido\n\n"
+                        "📖 <i>Comandos disponibles:</i>\n"
+                        "• <code>/libros</code> — Ver catálogo interactivo del grupo\n"
+                        "• <code>/buscar &lt;título&gt;</code> — Buscar libros en este grupo\n"
+                        "• <code>/temas</code> — Ver géneros y estantes disponibles\n"
+                        "• <code>/leerjuntos</code> — Iniciar o unirse a una lectura conjunta\n"
+                        "• <code>/help</code> — Ver guía de comandos\n\n"
+                        "✨ ¡Sube cualquier archivo PDF o EPUB al chat y Griffin lo catalogará y reubicará automáticamente!"
                     )
-                    session.add(new_link)
-                await session.commit()
+                    await message.reply_text(msg, parse_mode="HTML")
+                    return
+                else:
+                    bot_username = (await bot.get_me()).username
+                    msg = (
+                        "⚠️ <b>Este grupo aún no está vinculado a una biblioteca.</b>\n\n"
+                        "Para activar la biblioteca inteligente en este grupo:\n"
+                        f"1. Abre el chat privado con @{bot_username}.\n"
+                        "2. Envía <code>/start</code> y selecciona <b>'👥 Biblioteca de Grupo'</b>.\n"
+                        "3. Elige la vigencia y usa el código o enlace generado.\n\n"
+                        "O si ya tienes un código, escribe en este grupo: <code>/start &lt;CODIGO&gt;</code>"
+                    )
+                    await message.reply_text(msg, parse_mode="HTML")
+                    return
 
-            safe_title = html.escape(status_info["chat_title"])
-            msg_lines = [
-                f"🎉 <b>¡Grupo '{safe_title}' vinculado exitosamente a tu app Anaquel!</b>\n",
-                f"• <b>Tipo:</b> <code>{chat_type_str}</code>",
-                f"• <b>Temas (Topics):</b> {'✅ Activado' if status_info['forum_enabled'] else '❌ Desactivado'}",
-                f"• <b>Bot Administrador:</b> {'✅ Sí' if status_info['bot_is_admin'] else '❌ No'}",
-                f"• <b>Permiso 'Administrar temas':</b> {'✅ Sí' if status_info.get('can_manage_topics') else '❌ No'}\n",
-                "📚 Este grupo ya está enlazado con tu app móvil. Todos los libros organizados se sincronizan en tu biblioteca digital."
-            ]
-            await message.reply_text("\n".join(msg_lines), parse_mode="HTML")
-            return
-
+    # Caso 2: /start <codigo>
     code_str = args[0].strip()
 
     async with AsyncSessionLocal() as session:
-        # 1. Validar código
-        stmt = select(LinkCode).where(
-            LinkCode.code == code_str,
-            LinkCode.used == False,
-            LinkCode.expires_at > datetime.now(timezone.utc)
-        )
+        stmt = select(LinkCode).where(LinkCode.code == code_str)
         res = await session.execute(stmt)
         link_code = res.scalar_one_or_none()
 
         if not link_code:
             await message.reply_text(
-                "⚠️ <b>Código inválido o expirado.</b>\n"
-                "Por favor genera un nuevo código de vinculación desde la app.",
+                "⚠️ <b>Código inválido.</b>\n"
+                "Por favor verifica el código o genera uno nuevo en el chat privado con el bot.",
                 parse_mode="HTML"
             )
             return
 
-        # 2. Obtener estado e inspección del chat
-        bot = context.bot
+        now_utc = datetime.now(timezone.utc)
+        exp = link_code.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+
+        if now_utc > exp:
+            await message.reply_text(
+                "⏳ <b>Este código de vinculación ha expirado.</b>\n"
+                "Por favor genera un código nuevo en el chat privado con el bot.",
+                parse_mode="HTML"
+            )
+            return
+
         try:
             status_info = await get_chat_and_bot_status(bot, chat.id)
         except Exception as e:
@@ -163,12 +201,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
 
-        # 3. Buscar si el link ya existía para actualizarlo o crearlo
         stmt_link = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
         res_link = await session.execute(stmt_link)
         existing_link = res_link.scalar_one_or_none()
 
-        safe_title = html.escape(status_info["chat_title"])
+        safe_title = html.escape(status_info["chat_title"] or chat.title or "Grupo")
 
         if existing_link:
             existing_link.user_id = link_code.user_id
@@ -188,28 +225,193 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             session.add(new_link)
 
-        # 4. Quemar código de vinculación
-        link_code.used = True
         await session.commit()
 
-        # 5. Respuesta informativa según configuración
         msg_lines = [
-            f"🎉 <b>¡Chat '{safe_title}' vinculado exitosamente a LibroSync!</b>\n",
+            f"🎉 <b>¡Grupo '{safe_title}' vinculado exitosamente!</b>\n",
             f"• <b>Tipo:</b> <code>{chat_type_str}</code>",
-            f"• <b>Temas (Forum):</b> {'✅ Activado' if status_info['forum_enabled'] else '❌ Desactivado'}",
-            f"• <b>Bot Admin:</b> {'✅ Sí' if status_info['bot_is_admin'] else '❌ No'}",
-            f"• <b>Permiso Manage Topics:</b> {'✅ Sí' if status_info['can_manage_topics'] else '❌ No'}\n"
+            f"• <b>Temas (Topics):</b> {'✅ Activado' if status_info['forum_enabled'] else '⚠️ Desactivado (activa temas para organizar por géneros)'}",
+            f"• <b>Bot Administrador:</b> {'✅ Sí' if status_info['bot_is_admin'] else '❌ No (haz al bot administrador)'}",
+            f"• <b>Permiso 'Administrar temas':</b> {'✅ Sí' if status_info.get('can_manage_topics') else '⚠️ No asignado'}\n",
+            "🔒 <b>Aislamiento Garantizado:</b> Este grupo cuenta con su propia biblioteca independiente. Ningún libro ni dato se mezcla con otros grupos ni con chats privados.\n",
+            "✨ <b>Modo Cero Fricción:</b> Puedes enviar libros directamente y Griffin los clasificará y moverá a su tema correspondiente de forma automática."
         ]
-
-        if not status_info["bot_is_admin"] or not status_info.get("can_manage_topics"):
-            msg_lines.append(
-                "⚠️ <b>Nota:</b> Para crear y organizar libros en temas automáticamente, "
-                "asegúrate de hacer al bot administrador con el permiso <b>'Administrar temas'</b>."
-            )
-        else:
-            msg_lines.append("🚀 ¡Motor de Inteligencia Artificial activo! Ya puedes enviar libros sin hashtags ni comandos.")
-
         await message.reply_text("\n".join(msg_lines), parse_mode="HTML")
+
+
+async def setup_mode_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja la selección inicial de modo: Personal o Grupo."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat = update.effective_chat
+    tg_user = update.effective_user
+
+    if data == "setup_mode:personal":
+        async with AsyncSessionLocal() as session:
+            stmt_u = select(User).where(User.telegram_user_id == tg_user.id)
+            user = (await session.execute(stmt_u)).scalar_one_or_none()
+            if not user:
+                user = User(
+                    telegram_user_id=tg_user.id,
+                    nombre=tg_user.full_name or tg_user.first_name or "Usuario Personal"
+                )
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+
+            stmt_l = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+            link = (await session.execute(stmt_l)).scalar_one_or_none()
+            if not link:
+                link = TelegramLink(
+                    user_id=user.id,
+                    chat_id=chat.id,
+                    chat_type="private",
+                    chat_title=f"Biblioteca Personal de {user.nombre}",
+                    bot_is_admin=True,
+                    forum_enabled=False
+                )
+                session.add(link)
+            else:
+                link.chat_type = "private"
+                link.user_id = user.id
+            await session.commit()
+
+        msg = (
+            "👤 <b>¡Biblioteca Personal Activada!</b>\n\n"
+            "Este chat privado es ahora tu estante personal e independiente:\n\n"
+            "• 📥 <b>Sube tus libros:</b> Envíame cualquier PDF, EPUB, MOBI, CBR o CBZ aquí y lo clasificaré con IA.\n"
+            "• 📚 <b>Catálogo:</b> Usa <code>/libros</code> para ver todos tus libros organizados.\n"
+            "• 🔍 <b>Búsqueda:</b> Usa <code>/buscar &lt;título o autor&gt;</code> para encontrar obras al instante.\n"
+            "• 🏷️ <b>Géneros:</b> Usa <code>/temas</code> para explorar tus lecturas por género.\n"
+            "• 📖 <b>Seguimiento:</b> Usa <code>/mislibros</code> y <code>/progreso &lt;%&gt;</code> para registrar tu avance de lectura.\n\n"
+            "✨ <i>¡Envíame un libro ahora mismo para comenzar tu colección personal!</i>"
+        )
+        keyboard = [
+            [InlineKeyboardButton("📚 Ver Catálogo", callback_data="catalog:page:1")],
+            [InlineKeyboardButton("👥 Configurar también un Grupo", callback_data="setup_mode:group")]
+        ]
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "setup_mode:group":
+        keyboard = [
+            [
+                InlineKeyboardButton("⏱️ 1 Hora", callback_data="code_exp:1h"),
+                InlineKeyboardButton("📅 24 Horas", callback_data="code_exp:24h"),
+            ],
+            [
+                InlineKeyboardButton("🗓️ 7 Días", callback_data="code_exp:7d"),
+                InlineKeyboardButton("📆 30 Días", callback_data="code_exp:30d"),
+            ],
+            [
+                InlineKeyboardButton("♾️ Permanente (Sin Expiración)", callback_data="code_exp:never")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Volver", callback_data="setup_mode:back")
+            ]
+        ]
+        msg = (
+            "👥 <b>Configuración de Biblioteca de Grupo</b>\n\n"
+            "Para vincular un grupo o club de lectura, generaremos un <b>código único de vinculación</b>.\n\n"
+            "⏱️ <b>Selecciona la vigencia / fecha de expiración para tu código:</b>\n"
+            "<i>(Podrás usar este código para vincular uno o varios grupos antes de que expire. Cada grupo mantendrá su biblioteca 100% aislada de los demás)</i>"
+        )
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "setup_mode:back":
+        user_name = html.escape(tg_user.first_name if tg_user else "lector")
+        keyboard = [
+            [InlineKeyboardButton("👤 Biblioteca Personal", callback_data="setup_mode:personal")],
+            [InlineKeyboardButton("👥 Biblioteca de Grupo", callback_data="setup_mode:group")],
+        ]
+        welcome_text = (
+            f"👋 <b>Soy Griffin, tu bibliotecario digital inteligente.</b>\n\n"
+            "📚 ¿Cómo deseas utilizarme hoy?\n\n"
+            "1️⃣ <b>Biblioteca Personal:</b>\n"
+            "Guarda y organiza tus libros directamente en este chat privado.\n\n"
+            "2️⃣ <b>Biblioteca de Grupo:</b>\n"
+            "Organiza la biblioteca de tu club de lectura en un grupo con <b>Temas/Topics</b>.\n\n"
+            "👇 <i>Selecciona una opción:</i>"
+        )
+        await query.edit_message_text(welcome_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def code_exp_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Genera el código único con la fecha de expiración elegida por el usuario."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    tg_user = update.effective_user
+    bot = context.bot
+
+    duration_key = data.replace("code_exp:", "")
+    now_utc = datetime.now(timezone.utc)
+
+    if duration_key == "1h":
+        expires_at = now_utc + timedelta(hours=1)
+        exp_label = "1 Hora"
+    elif duration_key == "24h":
+        expires_at = now_utc + timedelta(days=1)
+        exp_label = "24 Horas"
+    elif duration_key == "7d":
+        expires_at = now_utc + timedelta(days=7)
+        exp_label = "7 Días"
+    elif duration_key == "30d":
+        expires_at = now_utc + timedelta(days=30)
+        exp_label = "30 Días"
+    else:  # "never"
+        expires_at = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+        exp_label = "Permanente (Sin Expiración)"
+
+    chars = string.ascii_uppercase + string.digits
+    rand_part = "".join(secrets.choice(chars) for _ in range(6))
+    code_str = f"GRP-{rand_part}"
+
+    async with AsyncSessionLocal() as session:
+        stmt_u = select(User).where(User.telegram_user_id == tg_user.id)
+        user = (await session.execute(stmt_u)).scalar_one_or_none()
+        if not user:
+            user = User(
+                telegram_user_id=tg_user.id,
+                nombre=tg_user.full_name or tg_user.first_name or "Administrador"
+            )
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+
+        link_code = LinkCode(
+            code=code_str,
+            user_id=user.id,
+            expires_at=expires_at,
+            used=False
+        )
+        session.add(link_code)
+        await session.commit()
+
+    bot_me = await bot.get_me()
+    deep_link = f"https://t.me/{bot_me.username}?startgroup={code_str}"
+    exp_date_str = expires_at.strftime("%d/%m/%Y %H:%M UTC") if duration_key != "never" else "Nunca (Permanente)"
+
+    msg = (
+        "🎉 <b>¡Código de Vinculación de Grupo Generado!</b>\n\n"
+        f"• <b>Código Único:</b> <code>{code_str}</code>\n"
+        f"• <b>Vigencia:</b> {exp_label}\n"
+        f"• <b>Expira el:</b> {exp_date_str}\n\n"
+        "📋 <b>Pasos para vincular tu grupo:</b>\n"
+        f"1. Pulsa el botón de abajo <b>'➕ Añadir a mi Grupo'</b> (o añade a @{bot_me.username} como admin).\n"
+        "2. Asegúrate de que el grupo tenga <b>Temas/Topics activados</b>.\n"
+        "3. Dale permiso de administrador con <b>'Administrar temas'</b>.\n"
+        f"4. Si lo añadiste manualmente, envía en el grupo: <code>/start {code_str}</code>\n\n"
+        "🔒 <b>Aislamiento Garantizado:</b> Cada grupo vinculado tendrá su propia biblioteca totalmente independiente. Ningún libro ni catálogo se mezclará con otros grupos ni con tu biblioteca personal."
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Añadir a mi Grupo", url=deep_link)],
+        [InlineKeyboardButton("🔄 Generar otro código", callback_data="setup_mode:group")],
+        [InlineKeyboardButton("👤 Ver mi Biblioteca Personal", callback_data="setup_mode:personal")]
+    ]
+    await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 
 async def set_topic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -622,7 +824,7 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=thread_id,
-                text="❌ Este grupo no está vinculado a Anaquel.",
+                text="❌ Este grupo no está vinculado a una biblioteca. Usa /start para ver opciones de vinculación.",
                 parse_mode="HTML"
             )
             return
@@ -639,19 +841,12 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 topic_filter = topic_obj.genre
                 topic_id_val = thread_id
 
-        # Consultar libros (en privado consulta los del usuario, en grupo los del grupo)
-        if chat.type == "private":
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.user_id == link.user_id)
-            )
-        else:
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.telegram_link_id == link.id)
-            )
+        # Consultar libros con aislamiento estricto por biblioteca/chat
+        stmt_books = (
+            select(Book)
+            .options(selectinload(Book.telegram_link))
+            .where(Book.telegram_link_id == link.id)
+        )
 
         if topic_filter:
             stmt_books = stmt_books.where(Book.genre == topic_filter)
@@ -745,18 +940,11 @@ async def catalog_callback_handler(update: Update, context: ContextTypes.DEFAULT
             if topic_obj:
                 topic_filter = topic_obj.genre
 
-        if chat.type == "private":
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.user_id == link.user_id)
-            )
-        else:
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.telegram_link_id == link.id)
-            )
+        stmt_books = (
+            select(Book)
+            .options(selectinload(Book.telegram_link))
+            .where(Book.telegram_link_id == link.id)
+        )
 
         if topic_filter:
             stmt_books = stmt_books.where(Book.genre == topic_filter)
@@ -867,7 +1055,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not raw_query:
         help_search = (
-            "🔍 <b>Búsqueda en la Biblioteca de Anaquel:</b>\n\n"
+            "🔍 <b>Búsqueda en la Biblioteca Digital:</b>\n\n"
             "Escribe el nombre del libro o autor que deseas encontrar.\n\n"
             "<b>Ejemplos de uso:</b>\n"
             "• <code>/buscar Cecelia Ahern</code> — <i>Muestra todos sus libros</i>\n"
@@ -908,26 +1096,18 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=thread_id,
-                text="❌ Este grupo no está vinculado a Anaquel.",
+                text="❌ Este grupo no está vinculado a una biblioteca. Usa /start para ver opciones de vinculación.",
                 parse_mode="HTML"
             )
             return
 
         # Consultar libros (en privado consulta los del usuario, en grupo los del grupo)
-        if chat.type == "private":
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.user_id == link.user_id)
-                .order_by(Book.title.asc())
-            )
-        else:
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.telegram_link_id == link.id)
-                .order_by(Book.title.asc())
-            )
+        stmt_books = (
+            select(Book)
+            .options(selectinload(Book.telegram_link))
+            .where(Book.telegram_link_id == link.id)
+            .order_by(Book.title.asc())
+        )
         b_res = await session.execute(stmt_books)
         all_books = b_res.scalars().all()
 
@@ -1023,20 +1203,12 @@ async def search_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if not link:
                 return
 
-            if chat.type == "private":
-                stmt_books = (
-                    select(Book)
-                    .options(selectinload(Book.telegram_link))
-                    .where(Book.user_id == link.user_id)
-                    .order_by(Book.title.asc())
-                )
-            else:
-                stmt_books = (
-                    select(Book)
-                    .options(selectinload(Book.telegram_link))
-                    .where(Book.telegram_link_id == link.id)
-                    .order_by(Book.title.asc())
-                )
+            stmt_books = (
+                select(Book)
+                .options(selectinload(Book.telegram_link))
+                .where(Book.telegram_link_id == link.id)
+                .order_by(Book.title.asc())
+            )
             b_res = await session.execute(stmt_books)
             all_books = b_res.scalars().all()
 
@@ -1327,7 +1499,7 @@ async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=thread_id,
-                text="❌ Este grupo no está vinculado a Anaquel.",
+                text="❌ Este grupo no está vinculado a una biblioteca. Usa /start para ver opciones de vinculación.",
                 parse_mode="HTML"
             )
             return
@@ -1336,11 +1508,8 @@ async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         t_res = await session.execute(stmt_topics)
         topics = t_res.scalars().all()
 
-        # Contar libros por tema
-        if chat.type == "private":
-            stmt_books = select(Book).where(Book.user_id == link.user_id)
-        else:
-            stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        # Contar libros por tema con aislamiento estricto
+        stmt_books = select(Book).where(Book.telegram_link_id == link.id)
         b_res = await session.execute(stmt_books)
         all_books = b_res.scalars().all()
 
@@ -1350,8 +1519,8 @@ async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if not topics and not all_books:
             empty_msg = (
-                "ℹ️ <b>Aún no hay temas registrados en este grupo.</b>\n\n"
-                "Sube libros para que Anaquel cree automáticamente cada estante por género."
+                "ℹ️ <b>Aún no hay temas registrados en esta biblioteca.</b>\n\n"
+                "Sube libros para que Griffin cree automáticamente cada estante por género."
             )
             try:
                 await context.bot.send_message(
@@ -1423,7 +1592,7 @@ def build_topics_page(
     page_items = topic_lines[start_idx:end_idx]
 
     lines = [
-        "🏷️ <b>Temas y Géneros Disponibles en Anaquel</b>",
+        "🏷️ <b>Temas y Géneros Disponibles</b>",
         f"<i>(Página {page} de {total_pages} — {total_topics} estantes registrados)</i>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
@@ -1473,10 +1642,8 @@ async def topics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         t_res = await session.execute(stmt_topics)
         topics = t_res.scalars().all()
 
-        if chat.type == "private":
-            stmt_books = select(Book).where(Book.user_id == link.user_id)
-        else:
-            stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+
         b_res = await session.execute(stmt_books)
         all_books = b_res.scalars().all()
 
@@ -1657,7 +1824,7 @@ async def topic_index_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=thread_id,
-                text="❌ Este grupo no está vinculado a Anaquel.",
+                text="❌ Este grupo no está vinculado a una biblioteca. Usa /start para ver opciones de vinculación.",
                 parse_mode="HTML"
             )
             return
@@ -1767,7 +1934,7 @@ async def register_reply_handler(update: Update, context: ContextTypes.DEFAULT_T
             async with AsyncSessionLocal() as session:
                 link = await _get_or_create_link(context.bot, session, chat.id)
                 if not link:
-                    await status_msg.edit_text("❌ Este grupo no está vinculado a Anaquel.", parse_mode="HTML")
+                    await status_msg.edit_text("❌ Este grupo no está vinculado a una biblioteca.", parse_mode="HTML")
                     return
 
                 res_dict = await process_book_message(
@@ -1862,7 +2029,7 @@ async def rename_book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         async with AsyncSessionLocal() as session:
             link = await _get_or_create_link(context.bot, session, chat.id)
             if not link:
-                await message.reply_text("❌ Este grupo no está vinculado a Anaquel.", parse_mode="HTML")
+                await message.reply_text("❌ Este grupo no está vinculado a una biblioteca.", parse_mode="HTML")
                 return
 
             # Construir condiciones seguras sin IS NULL
@@ -1927,7 +2094,7 @@ async def rename_book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"✍️ <b>Autor:</b> {author_safe}\n"
         f"🏷️ <b>Tema:</b> {emo} <b>{book.genre}</b>\n"
         f"{pub_info}\n"
-        f"<i>El catálogo y la aplicación Anaquel se han actualizado con la información correcta.</i>",
+        f"<i>El catálogo de la biblioteca se ha actualizado con la información correcta.</i>",
         parse_mode="HTML"
     )
 
@@ -1949,7 +2116,7 @@ async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await context.bot.send_message(
             chat_id=chat.id,
             message_thread_id=thread_id,
-            text="🔄 <i>Verificando y sincronizando estantes de Anaquel con Telegram...</i>",
+            text="🔄 <i>Verificando y sincronizando estantes de la biblioteca con Telegram...</i>",
             parse_mode="HTML"
         )
     except Exception:
@@ -1960,7 +2127,7 @@ async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
         link = await _get_or_create_link(context.bot, session, chat.id)
         if not link:
-            err_text = "❌ Este grupo aún no está vinculado a Anaquel."
+            err_text = "❌ Este grupo aún no está vinculado a una biblioteca."
             if status_msg:
                 await status_msg.edit_text(err_text, parse_mode="HTML")
             else:
@@ -2022,7 +2189,7 @@ async def deduplicate_command_handler(update: Update, context: ContextTypes.DEFA
     async with AsyncSessionLocal() as session:
         link = await _get_or_create_link(context.bot, session, chat.id)
         if not link:
-            err_text = "❌ Este grupo no está vinculado a Anaquel."
+            err_text = "❌ Este grupo no está vinculado a una biblioteca."
             if status_msg:
                 await status_msg.edit_text(err_text, parse_mode="HTML")
             else:
@@ -2228,23 +2395,16 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=thread_id,
-                text="❌ Este grupo no está vinculado a Anaquel.",
+                text="❌ Este grupo no está vinculado a una biblioteca. Usa /start para ver opciones de vinculación.",
                 parse_mode="HTML"
             )
             return
 
-        if chat.type == "private":
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.user_id == link.user_id)
-            )
-        else:
-            stmt_books = (
-                select(Book)
-                .options(selectinload(Book.telegram_link))
-                .where(Book.telegram_link_id == link.id)
-            )
+        stmt_books = (
+            select(Book)
+            .options(selectinload(Book.telegram_link))
+            .where(Book.telegram_link_id == link.id)
+        )
         all_books = (await session.execute(stmt_books)).scalars().all()
 
         target_book = None
@@ -2385,7 +2545,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thread_id = getattr(message, "message_thread_id", None)
     help_text = (
-        "🤖 <b>Comandos Disponibles en Anaquel:</b>\n\n"
+        "🤖 <b>Comandos Disponibles:</b>\n\n"
         "📚 <b>Biblioteca & Catálogo:</b>\n"
         "• <code>/info &lt;libro o autor&gt;</code> — Ficha detallada: saga/trilogía, continuación, libros anteriores/siguientes y temas.\n"
         "• <code>/descargar &lt;libro o autor&gt;</code> — Busca y descarga libros externos (EPUB/PDF) a la biblioteca.\n"
@@ -2393,15 +2553,19 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/libros</code> o <code>/catalogo</code> — Catálogo paginado con título, autor, publicación y tema.\n"
         "• <code>/temas</code> — Ver todos los géneros registrados con conteo de libros.\n"
         "• <code>/indice</code> — <i>(Dentro de un tema)</i> Genera la lista de libros de ese tema para fijar.\n\n"
+        "👥 <b>Club de Lectura:</b>\n"
+        "• <code>/leerjuntos &lt;libro&gt;</code> — Iniciar o unirse a una lectura conjunta con tarjeta interactiva.\n"
+        "• <code>/mislibros</code> — Ver tus estantes personales: Leyendo, Favoritos, Terminados y Por Leer.\n"
+        "• <code>/progreso &lt;%&gt;</code> — Actualizar tu avance de lectura en tiempo real.\n\n"
         "⚙️ <b>Administración & Organización:</b>\n"
         "• <code>/deduplicar</code> — Escanea y elimina libros duplicados automáticamente en Telegram y catálogo.\n"
         "• <code>/sincronizar</code> o <code>/limpiar</code> — Depura libros eliminados, audita extraviados y actualiza estantes.\n"
         "• <code>/registrar</code> — Responde a un mensaje antiguo con PDF o EPUB para indexarlo (o <code>/registrar Título - Autor</code>).\n"
         "• <code>/renombrar &lt;Título&gt; - &lt;Autor&gt;</code> — Corrige el título o autor de un libro respondiendo a su mensaje.\n"
         "• <code>/settopic &lt;Género&gt;</code> — <i>(Dentro de un tema)</i> Asigna ese tema manualmente a un género.\n"
-        "• <code>/start</code> — Ver estado del bot o vincular el grupo a la app móvil Anaquel.\n"
+        "• <code>/start</code> — Menú interactivo de inicio y vinculación de biblioteca personal o de grupo.\n"
         "• <code>/help</code> — Ver este menú de ayuda.\n\n"
-        "✨ <b>Modo Cero Fricción:</b> No necesitas comandos para libros nuevos: ¡solo envía cualquier PDF o EPUB al chat y Anaquel se encarga de todo!"
+        "✨ <b>Modo Cero Fricción:</b> No necesitas comandos para libros nuevos: ¡solo envía cualquier PDF o EPUB al chat y Griffin se encarga de todo!"
     )
     try:
         await context.bot.send_message(
@@ -2439,24 +2603,28 @@ async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAU
             chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
 
             if not link:
-                link = TelegramLink(
-                    user_id=1,
-                    chat_id=chat.id,
-                    chat_type=chat_type_str,
-                    chat_title=status_info["chat_title"],
-                    bot_is_admin=status_info["bot_is_admin"],
-                    forum_enabled=status_info["forum_enabled"]
+                bot_me = await context.bot.get_me()
+                unlinked_text = (
+                    "👋 <b>¡Hola a todos! Soy Griffin, tu bibliotecario inteligente de LibroSync.</b>\n\n"
+                    "📚 <b>Para activar y vincular la biblioteca de este grupo:</b>\n"
+                    f"1. Abre el chat privado con @{bot_me.username}.\n"
+                    "2. Envía <code>/start</code> y selecciona <b>'👥 Biblioteca de Grupo'</b>.\n"
+                    "3. Elige la vigencia del código y usa el botón para añadir el bot o escribe aquí: <code>/start &lt;CODIGO&gt;</code>\n\n"
+                    "💡 <i>Asegúrate de activar <b>Temas/Topics</b> en este grupo y otorgarme permiso de <b>'Administrar temas'</b> para organizar los libros por género automáticamente.</i>"
                 )
-                session.add(link)
-            else:
-                link.chat_title = status_info["chat_title"]
-                link.bot_is_admin = status_info["bot_is_admin"]
-                link.forum_enabled = status_info["forum_enabled"]
+                try:
+                    await context.bot.send_message(chat_id=chat.id, text=unlinked_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.debug(f"No se pudo enviar mensaje de bienvenida a grupo no vinculado: {e}")
+                return
 
+            link.chat_title = status_info["chat_title"]
+            link.bot_is_admin = status_info["bot_is_admin"]
+            link.forum_enabled = status_info["forum_enabled"]
             await session.commit()
 
             welcome_text = (
-                "👋 <b>¡Hola a todos! Soy Griffin, el bibliotecario inteligente de LibroSync / Anaquel.</b>\n\n"
+                "👋 <b>¡Hola a todos! Soy Griffin, el bibliotecario inteligente de LibroSync.</b>\n\n"
                 "📚 <b>Estoy listo para organizar, enriquecer y gestionar la biblioteca de este grupo de forma completamente autónoma:</b>\n\n"
                 "✨ <b>Modo Cero Fricción (Automático):</b>\n"
                 "• <b>Sube cualquier libro:</b> Admite <b>PDF, EPUB, MOBI, CBR y CBZ</b> (individual o en álbumes/lotes).\n"
@@ -2514,13 +2682,10 @@ async def buddy_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     async with AsyncSessionLocal() as session:
         link = await _get_or_create_link(context.bot, session, chat.id)
         if not link:
-            await message.reply_text("❌ Este chat no está vinculado a Anaquel.", parse_mode="HTML")
+            await message.reply_text("❌ Este chat no está vinculado a una biblioteca.", parse_mode="HTML")
             return
 
-        if chat.type == "private":
-            stmt_books = select(Book).options(selectinload(Book.telegram_link)).where(Book.user_id == link.user_id)
-        else:
-            stmt_books = select(Book).options(selectinload(Book.telegram_link)).where(Book.telegram_link_id == link.id)
+        stmt_books = select(Book).options(selectinload(Book.telegram_link)).where(Book.telegram_link_id == link.id)
         all_books = (await session.execute(stmt_books)).scalars().all()
 
         target_book = None
@@ -2546,7 +2711,7 @@ async def buddy_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             query_str = " ".join(context.args).strip() if context.args else ""
             if not query_str:
                 help_br = (
-                    "📖 <b>Lecturas Conjuntas en Anaquel:</b>\n\n"
+                    "📖 <b>Lecturas Conjuntas:</b>\n\n"
                     "Lee un libro junto a otros miembros del club y compartan su avance en tiempo real.\n\n"
                     "<b>Formas de uso:</b>\n"
                     "• Responde a cualquier libro con <code>/leerjuntos</code>\n"

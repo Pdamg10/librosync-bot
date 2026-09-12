@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  griffin-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: griffin_librosync_bot
+    restart: always
+    env_file:
+      - backend/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=sqlite+aiosqlite:///librosync.db
+    volumes:
+      # Montar la base de datos local para que los cambios persistan en el host
+      - ./librosync.db:/app/librosync.db

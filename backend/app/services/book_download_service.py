@@ -440,12 +440,12 @@ async def ingest_downloaded_book(
     original_meta: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Procesa un libro descargado externamente y lo integra en la biblioteca de Anaquel:
+    Procesa un libro descargado externamente y lo integra en la biblioteca de LibroSync:
     1. Inspecciona metadatos internos (EPUB Dublin Core o PDF).
     2. Clasifica y normaliza con Gemini AI (título, autor, género, año de publicación).
     3. Resuelve o crea el Topic correspondiente en Telegram.
     4. Envía el archivo vía Telegram Bot API al Topic.
-    5. Guarda el registro en la base de datos de Anaquel.
+    5. Guarda el registro en la base de datos.
     """
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "epub"
 
