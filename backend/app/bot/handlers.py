@@ -1,10 +1,11 @@
+from __future__ import annotations
 import logging
 import re
 import html
 import secrets
 import string
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
