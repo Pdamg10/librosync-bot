@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, AliasChoices
 from typing import Optional
 
 from pathlib import Path
@@ -24,7 +25,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = f"sqlite+aiosqlite:///{BASE_DIR}/librosync.db"
     
     # API
-    API_PORT: int = 8000
+    API_PORT: int = Field(default=8000, validation_alias=AliasChoices("PORT", "API_PORT"))
     API_HOST: str = "0.0.0.0"
     
     # Linking

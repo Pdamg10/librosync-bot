@@ -66,14 +66,14 @@ async def run_bot():
             if not getattr(bot_app, "_running", False):
                 await bot_app.start()
 
-            # Descartar webhooks residuales y purgar conflictos previos
+            # Descartar webhooks residuales sin purgar mensajes en cola
             try:
-                await bot_app.bot.delete_webhook(drop_pending_updates=True)
+                await bot_app.bot.delete_webhook(drop_pending_updates=False)
             except Exception:
                 pass
 
             await setup_bot_commands(bot_app.bot)
-            await bot_app.updater.start_polling(drop_pending_updates=True)
+            await bot_app.updater.start_polling(drop_pending_updates=False)
             logger.info("✅ Bot de Telegram en línea y escuchando actualizaciones.")
             started = True
             break
@@ -112,8 +112,8 @@ async def run_bot():
                     await asyncio.sleep(5)
                     if not stop_event.is_set():
                         try:
-                            await bot_app.bot.delete_webhook(drop_pending_updates=True)
-                            await bot_app.updater.start_polling(drop_pending_updates=True)
+                            await bot_app.bot.delete_webhook(drop_pending_updates=False)
+                            await bot_app.updater.start_polling(drop_pending_updates=False)
                             logger.info("✅ Polling de Telegram restablecido exitosamente por watchdog.")
                         except Exception as restart_err:
                             logger.warning(f"Reintento de polling fallido: {restart_err}")
