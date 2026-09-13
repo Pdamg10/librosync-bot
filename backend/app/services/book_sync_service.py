@@ -283,14 +283,21 @@ async def reorganize_misplaced_books(
     link: TelegramLink,
     chat_id: int,
     force: bool = False,
-    threshold: int = 10
+    threshold: int = 10,
+    current_thread_id: Optional[int] = None,
+    batch_size: int = 20
 ) -> Dict[str, Any]:
     """
-    Detecta libros que no están en su tema correspondiente y los mueve al topic correcto.
-    Si force=False, solo actúa si la cantidad de libros fuera de tema supera 'threshold' (10 libros).
+    Detecta libros que no están en su tema correspondiente o están en 'General' y los mueve al topic correcto.
+    1. Para libros preexistentes con género específico, asigna su telegram_topic_id correspondiente sin duplicar.
+    2. Si se ejecuta en General (o se detectan libros en General), re-clasifica con IA los libros en 'General'
+       para derivarlos a sus estantes temáticos (Romance, Fantasía, etc.).
+    3. Si se ejecuta en un topic específico, solo reorganiza los libros que pertenezcan a ese topic.
+    4. Mueve los mensajes al nuevo topic y elimina el original (si los permisos de Telegram lo permiten).
     """
     from app.services.topic_resolver import resolve_or_create_topic
     from app.services.telegram_service import move_or_repost_to_topic
+    from app.services.ai_classifier import classify_book_with_gemini
 
     if not link.forum_enabled:
         return {
@@ -307,15 +314,38 @@ async def reorganize_misplaced_books(
     stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
     t_res = await session.execute(stmt_topics)
     topic_map = {t.genre: t.topic_id for t in t_res.scalars().all()}
+    general_topic_id = topic_map.get("General")
 
-    misplaced = []
+    # 1. Backfill seguro en memoria: libros con género definido ya archivados en sus temas
     for b in all_books:
-        target_topic_id = topic_map.get(b.genre)
-        if b.telegram_topic_id is None or (target_topic_id and b.telegram_topic_id != target_topic_id):
-            misplaced.append(b)
+        if b.telegram_topic_id is None and b.genre and b.genre != "General":
+            matched_id = topic_map.get(b.genre)
+            if matched_id:
+                b.telegram_topic_id = matched_id
 
-    misplaced_count = len(misplaced)
+    # 2. Filtrado de candidatos a reorganización según contexto
+    is_general_context = (
+        current_thread_id is None 
+        or current_thread_id == 1 
+        or (general_topic_id is not None and current_thread_id == general_topic_id)
+    )
+
+    candidates = []
+    for b in all_books:
+        # Caso A: Libro en General que necesita re-clasificación y mudanza
+        if b.genre == "General" or (general_topic_id is not None and b.telegram_topic_id == general_topic_id):
+            if current_thread_id is None or is_general_context:
+                candidates.append(b)
+        # Caso B: Libro con topic_id explícito que no coincide con el estante de su género
+        elif b.telegram_topic_id is not None:
+            expected_topic = topic_map.get(b.genre)
+            if expected_topic and b.telegram_topic_id != expected_topic:
+                if current_thread_id is None or b.telegram_topic_id == current_thread_id:
+                    candidates.append(b)
+
+    misplaced_count = len(candidates)
     if not force and misplaced_count < threshold:
+        await session.commit()
         return {
             "status": "threshold_not_reached",
             "misplaced_count": misplaced_count,
@@ -323,9 +353,27 @@ async def reorganize_misplaced_books(
             "moved_count": 0
         }
 
+    # 3. Procesamiento en lote controlado (evitar rate limits y timeouts)
+    to_process = candidates[:batch_size]
     moved_count = 0
-    for b in misplaced:
+    reclassified_count = 0
+
+    for b in to_process:
         try:
+            # Si el libro está en 'General', re-evaluar con IA para encontrar su verdadero género
+            if b.genre == "General":
+                classification = await classify_book_with_gemini(
+                    filename=f"{b.title}.{b.file_format or 'epub'}",
+                    caption=f"{b.title} {b.author if b.author != 'Desconocido' else ''}",
+                    existing_topics=list(topic_map.keys())
+                )
+                new_genre = classification.get("genre")
+                if new_genre and new_genre != "General":
+                    b.genre = new_genre
+                    reclassified_count += 1
+                if classification.get("author") and b.author in ["Desconocido", None, ""]:
+                    b.author = classification.get("author")
+
             target_topic_id = topic_map.get(b.genre)
             if not target_topic_id:
                 target_topic_id = await resolve_or_create_topic(
@@ -336,7 +384,7 @@ async def reorganize_misplaced_books(
                 )
                 topic_map[b.genre] = target_topic_id
 
-            if target_topic_id and b.telegram_message_id:
+            if target_topic_id and b.telegram_message_id and b.telegram_topic_id != target_topic_id:
                 reposted_id = await move_or_repost_to_topic(
                     bot=bot,
                     chat_id=chat_id,
@@ -348,7 +396,10 @@ async def reorganize_misplaced_books(
                     b.telegram_message_id = reposted_id
                     b.telegram_topic_id = target_topic_id
                     moved_count += 1
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
+            elif b.telegram_topic_id == target_topic_id:
+                # Ya está en el topic correcto
+                pass
         except Exception as e:
             logger.warning(f"Error reorganizando libro {b.id} ({b.title}): {e}")
 
@@ -358,7 +409,10 @@ async def reorganize_misplaced_books(
         "status": "success",
         "misplaced_count": misplaced_count,
         "moved_count": moved_count,
-        "threshold": threshold
+        "reclassified_count": reclassified_count,
+        "remaining_count": max(0, misplaced_count - moved_count),
+        "threshold": threshold,
+        "batch_processed": len(to_process)
     }
 
 

@@ -3328,11 +3328,14 @@ async def reorganize_command_handler(update: Update, context: ContextTypes.DEFAU
             session=session,
             link=link,
             chat_id=chat.id,
-            force=True
+            force=True,
+            current_thread_id=getattr(message, "message_thread_id", None)
         )
 
     moved = res.get("moved_count", 0)
     misplaced = res.get("misplaced_count", 0)
+    reclassified = res.get("reclassified_count", 0)
+    remaining = res.get("remaining_count", 0)
 
     if misplaced == 0:
         await status_msg.edit_text(
@@ -3340,11 +3343,16 @@ async def reorganize_command_handler(update: Update, context: ContextTypes.DEFAU
             parse_mode="HTML"
         )
     else:
+        reclass_msg = f"• <b>Re-clasificados con IA:</b> <code>{reclassified}</code>\n" if reclassified > 0 else ""
+        rem_msg = f"• <b>Libros restantes por procesar:</b> <code>{remaining}</code>\n" if remaining > 0 else ""
         await status_msg.edit_text(
             f"📦 <b>Reorganización Completada:</b>\n\n"
-            f"• <b>Libros fuera de tema detectados:</b> <code>{misplaced}</code>\n"
-            f"• <b>Libros movidos exitosamente:</b> <code>{moved}</code>\n\n"
-            "🏷️ <i>Todos los libros han sido archivados en sus estantes temáticos.</i>",
+            f"• <b>Libros detectados en este tema:</b> <code>{misplaced}</code>\n"
+            f"• <b>Libros movidos a sus estantes:</b> <code>{moved}</code>\n"
+            f"{reclass_msg}"
+            f"{rem_msg}\n"
+            "🏷️ <i>Los libros han sido archivados en sus estantes temáticos.</i>\n\n"
+            "💡 <i>Nota: Si el mensaje original fue publicado por el creador del grupo, la API de Telegram no permite borrarlo; se creó la copia en su tema correspondiente.</i>",
             parse_mode="HTML"
         )
 
