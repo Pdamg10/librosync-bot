@@ -14,14 +14,21 @@ logging.basicConfig(
 logger = logging.getLogger("librosync")
 
 
+_bot_connected = False
+
+
 async def handle_health_check(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Responde 200 OK a las sondas HTTP de salud de Hugging Face Spaces / Docker / Koyeb."""
+    """Responde 200 OK a las sondas HTTP de salud de Hugging Face Spaces / Docker / Koyeb / Render."""
     try:
         await reader.read(1024)
-        body = b'{"status":"ok","service":"librosync-bot"}'
+        body = (
+            f'{{"status":"ok","service":"librosync-bot","telegram_connected":{str(_bot_connected).lower()},'
+            f'"bot_username":"{settings.TELEGRAM_BOT_USERNAME}"}}'
+        ).encode("utf-8")
         response = (
             b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
+            b"Content-Type: application/json; charset=utf-8\r\n"
+            b"Access-Control-Allow-Origin: *\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"Connection: close\r\n\r\n" + body
         )
@@ -37,8 +44,28 @@ async def handle_health_check(reader: asyncio.StreamReader, writer: asyncio.Stre
             pass
 
 
+async def keep_alive_task(stop_event: asyncio.Event, target_url: str):
+    """Mantiene despierto el contenedor en plataformas con sleep por inactividad (ej. Render Free)."""
+    logger.info(f"⏰ Keep-alive pinger activo hacia: {target_url}")
+    await asyncio.sleep(60)
+    while not stop_event.is_set():
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(target_url)
+                logger.info(f"📡 Ping keep-alive enviado a {target_url} (HTTP {res.status_code})")
+        except Exception as e:
+            logger.warning(f"Aviso en ping keep-alive hacia {target_url}: {e}")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=540.0)  # Cada 9 minutos
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_bot():
     """Servicio asíncrono puro de Python para el Bot de Telegram Griffin / LibroSync."""
+    global _bot_connected
+
     # 0. Iniciar servidor HTTP ligero para health check en la nube
     health_server = None
     try:
@@ -54,12 +81,27 @@ async def run_bot():
     await init_db()
     logger.info("Base de datos SQLite sincronizada y lista.")
 
-    # 2. Inicializar Bot de Telegram (Polling)
-    bot_app = get_bot_application()
-    logger.info("Iniciando bot de Telegram (Griffin / LibroSync) en modo servicio puro...")
+    # 2. Configurar señales de parada temprana
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
 
-    started = False
-    for attempt in range(1, 11):
+    # 3. Lanzar worker keep-alive si hay URL pública disponible (ej. Render / Spaces)
+    keep_alive_handle = None
+    if settings.KEEP_ALIVE_URL:
+        keep_alive_handle = asyncio.create_task(keep_alive_task(stop_event, settings.KEEP_ALIVE_URL))
+
+    # 4. Inicializar Bot de Telegram (Polling resiliente con reintento infinito)
+    bot_app = get_bot_application()
+    logger.info("Iniciando bot de Telegram (Griffin / LibroSync) en modo servicio continuo...")
+
+    attempt = 0
+    while not stop_event.is_set():
+        attempt += 1
         try:
             if not getattr(bot_app, "_initialized", False):
                 await bot_app.initialize()
@@ -74,49 +116,44 @@ async def run_bot():
 
             await setup_bot_commands(bot_app.bot)
             await bot_app.updater.start_polling(drop_pending_updates=False)
+            _bot_connected = True
             logger.info("✅ Bot de Telegram en línea y escuchando actualizaciones.")
-            started = True
             break
         except Exception as e:
             err_str = str(e).lower()
-            wait_sec = 4
             if "conflict" in err_str:
-                logger.warning(f"Telegram 409 Conflict detectado (contenedor previo en Render apagándose). Esperando {wait_sec}s (intento {attempt}/10)...")
+                logger.warning(
+                    f"⚠️ Telegram 409 Conflict detectado (otra instancia del bot tiene el token). "
+                    f"Esperando 5s para reintentar (intento #{attempt})..."
+                )
+                wait_sec = 5
             else:
-                logger.warning(f"Intento {attempt}/10 para iniciar el bot de Telegram falló: {e}. Reintentando en {wait_sec}s...")
-            await asyncio.sleep(wait_sec)
+                wait_sec = min(30, 4 + attempt * 2)
+                logger.warning(f"Intento #{attempt} para iniciar bot de Telegram falló: {e}. Reintentando en {wait_sec}s...")
 
-    if not started:
-        logger.error("No se pudo iniciar el bot de Telegram tras 10 intentos. Abortando.")
-        if health_server:
-            health_server.close()
-            await health_server.wait_closed()
-        return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=wait_sec)
+            except asyncio.TimeoutError:
+                pass
 
-    # 3. Watchdog Activo: Mantener servicio vivo y revivir polling automáticamente
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except (NotImplementedError, RuntimeError):
-            pass
-
+    # 5. Watchdog Activo: Mantener servicio vivo y revivir polling automáticamente
     try:
         while not stop_event.is_set():
             try:
-                # Comprobar si el updater se detuvo por un 409 o desconexión transitoria
                 if bot_app.updater and not bot_app.updater.running and not stop_event.is_set():
+                    _bot_connected = False
                     logger.warning("⚠️ Updater de Telegram detenido inesperadamente. Reiniciando polling en 5s...")
                     await asyncio.sleep(5)
                     if not stop_event.is_set():
                         try:
                             await bot_app.bot.delete_webhook(drop_pending_updates=False)
                             await bot_app.updater.start_polling(drop_pending_updates=False)
+                            _bot_connected = True
                             logger.info("✅ Polling de Telegram restablecido exitosamente por watchdog.")
                         except Exception as restart_err:
                             logger.warning(f"Reintento de polling fallido: {restart_err}")
+                elif bot_app.updater and bot_app.updater.running:
+                    _bot_connected = True
             except Exception as watchdog_err:
                 logger.error(f"Error en watchdog del bot: {watchdog_err}")
 
@@ -126,6 +163,9 @@ async def run_bot():
                 pass
     finally:
         logger.info("Deteniendo bot de Telegram de forma controlada...")
+        _bot_connected = False
+        if keep_alive_handle and not keep_alive_handle.done():
+            keep_alive_handle.cancel()
         if bot_app.updater and bot_app.updater.running:
             await bot_app.updater.stop()
         await bot_app.stop()

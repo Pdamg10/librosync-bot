@@ -23,5 +23,8 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 COPY backend /app/backend
 COPY librosync.db /app/librosync.db
 
+# Exponer puertos para Render/Koyeb (8000) y Hugging Face Spaces (7860)
+EXPOSE 8000 7860
+
 # Iniciar el bot de Telegram en modo servicio puro
 CMD ["python", "-m", "app.main"]
