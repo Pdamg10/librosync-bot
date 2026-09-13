@@ -1,3 +1,4 @@
+from __future__ import annotations
 import app.core.network_patch
 
 import logging
@@ -15,6 +16,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
+    ContextTypes,
     filters,
 )
 from app.core.config import settings
