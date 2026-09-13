@@ -4,6 +4,7 @@ import logging
 from telegram import (
     BotCommand,
     BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
 )
@@ -74,6 +75,7 @@ async def setup_bot_commands(bot):
             BotCommand("help", "Mostrar ayuda y comandos disponibles"),
         ]
         await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
         await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
         await bot.set_my_commands(commands, scope=BotCommandScopeAllChatAdministrators())
         logger.info("Menú de comandos de Telegram configurado con éxito en todos los ámbitos.")
