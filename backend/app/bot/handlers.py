@@ -2123,7 +2123,7 @@ async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    from app.services.book_sync_service import sync_all_library_for_chat
+    from app.services.book_sync_service import sync_all_library_for_chat, reorganize_misplaced_books
 
     async with AsyncSessionLocal() as session:
         link = await _get_or_create_link(context.bot, session, chat.id)
@@ -2136,17 +2136,31 @@ async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         sync_result = await sync_all_library_for_chat(context.bot, session, link.id, chat.id)
+        reorg_result = {}
+        if link.forum_enabled:
+            reorg_result = await reorganize_misplaced_books(
+                bot=context.bot,
+                session=session,
+                link=link,
+                chat_id=chat.id,
+                force=False,
+                threshold=10
+            )
 
     purged = sync_result.get("purged_books", 0)
     duplicates = sync_result.get("duplicates_removed", 0)
     active = sync_result.get("active_books", 0)
     topics = sync_result.get("active_topics", 0)
+    reorg_moved = reorg_result.get("moved_count", 0)
+
+    reorg_line = f"📦 <b>Libros fuera de tema reubicados:</b> <code>{reorg_moved}</code>\n" if reorg_moved > 0 else ""
 
     clean_text = (
         "🧹 <b>Sincronización y Mantenimiento Completados</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <b>Libros extraviados detectados:</b> <code>{purged}</code>\n"
         f"🗑️ <b>Copias duplicadas eliminadas:</b> <code>{duplicates}</code>\n"
+        f"{reorg_line}"
         f"📚 <b>Libros activos en la biblioteca:</b> <code>{active}</code>\n"
         f"🏷️ <b>Temas organizados:</b> <code>{topics}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2512,8 +2526,15 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         info_buttons = [
             [
-                InlineKeyboardButton("🤝 Leer en conjunto", callback_data=f"br:start:{target_book.id}"),
-                InlineKeyboardButton("⭐ Favorito", callback_data=f"rs:fav:{target_book.id}")
+                InlineKeyboardButton("📖 Leyendo", callback_data=f"rs:reading:{target_book.id}"),
+                InlineKeyboardButton("✅ Leído", callback_data=f"rs:finished:{target_book.id}"),
+            ],
+            [
+                InlineKeyboardButton("⭐ Favorito", callback_data=f"rs:fav:{target_book.id}"),
+                InlineKeyboardButton("📊 Progreso", callback_data=f"rs:prog:{target_book.id}"),
+            ],
+            [
+                InlineKeyboardButton("🤝 Lectura Conjunta", callback_data=f"br:start:{target_book.id}"),
             ]
         ]
         info_kb = InlineKeyboardMarkup(info_buttons)
@@ -2807,60 +2828,109 @@ async def my_books_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_db = await get_or_create_user_from_telegram(session, user_tg)
         shelves = await get_user_reading_shelves(session, user_db.id)
 
+        # Consultar lecturas conjuntas activas y sus co-lectores
+        stmt_br = (
+            select(BuddyRead)
+            .join(BuddyReadMember, BuddyReadMember.buddy_read_id == BuddyRead.id)
+            .options(
+                selectinload(BuddyRead.book),
+                selectinload(BuddyRead.members).selectinload(BuddyReadMember.user)
+            )
+            .where(
+                BuddyReadMember.user_id == user_db.id,
+                BuddyRead.status == "active"
+            )
+        )
+        br_res = await session.execute(stmt_br)
+        active_buddy_reads = br_res.scalars().all()
+
     u_name = html.escape(user_tg.first_name or user_tg.username or "Lector")
     lines = [
-        f"📚 <b>Estantes de Lectura de {u_name}</b>",
+        f"📚 <b>Perfil de Lectura de {u_name}</b>",
         f"<i>(Total en seguimiento: {shelves['total_tracked']} obras)</i>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
 
+    # 1. Libros leídos y cuáles
+    finished = shelves["finished"]
+    lines.append(f"🏆 <b>Libros Leídos / Terminados ({len(finished)}):</b>")
+    if finished:
+        for fin in finished[:15]:
+            fin_title = html.escape(fin.book.title if fin.book else "Libro")
+            fin_auth = html.escape(fin.book.author if (fin.book and fin.book.author) else "")
+            auth_str = f" — <i>{fin_auth}</i>" if fin_auth else ""
+            lines.append(f"• ✅ <b>{fin_title}</b>{auth_str}")
+        if len(finished) > 15:
+            lines.append(f"  <i>... y {len(finished) - 15} libros más</i>")
+    else:
+        lines.append("<i>(Aún no has marcado libros terminados)</i>")
+    lines.append("")
+
+    # 2. Leyendo actualmente y su progreso
     reading = shelves["reading"]
     lines.append(f"📖 <b>Leyendo Actualmente ({len(reading)}):</b>")
     if reading:
         for r in reading:
             b_title = html.escape(r.book.title if r.book else "Libro")
             b_auth = html.escape(r.book.author if r.book else "Desconocido")
-            bar = format_progress_bar(r.progress_percent, length=8)
-            lines.append(f"• <b>{b_title}</b> — <i>{b_auth}</i>\n  Avance: {bar}")
+            pct = r.progress_percent or 0.0
+            bar = format_progress_bar(pct, length=8)
+            lines.append(f"• <b>{b_title}</b> — <i>{b_auth}</i>\n  Avance: {bar} (<b>{pct:.0f}%</b>)")
     else:
         lines.append("<i>(No tienes libros en curso actualmente)</i>")
     lines.append("")
 
+    # 3. Lectura en conjunto y con quién
+    lines.append(f"🤝 <b>Lecturas Conjuntas Activas ({len(active_buddy_reads)}):</b>")
+    if active_buddy_reads:
+        for br in active_buddy_reads:
+            b_title = html.escape(br.book.title if br.book else "Libro")
+            co_members = [
+                html.escape(m.user.display_name or m.user.username or f"Lector {m.user_id}")
+                for m in br.members if m.user_id != user_db.id
+            ]
+            if co_members:
+                with_str = f"Leyendo con: <b>{', '.join(co_members[:4])}</b>"
+                if len(co_members) > 4:
+                    with_str += f" (+{len(co_members) - 4} más)"
+            else:
+                with_str = "<i>(Esperando co-lectores)</i>"
+
+            my_m = next((m for m in br.members if m.user_id == user_db.id), None)
+            my_pct = my_m.progress_percent if my_m else 0.0
+            my_bar = format_progress_bar(my_pct, length=8)
+            lines.append(f"• <b>{b_title}</b>\n  👥 {with_str}\n  Tu avance: {my_bar} (<b>{my_pct:.0f}%</b>)")
+    else:
+        lines.append("<i>(No estás participando en ninguna lectura conjunta activa)</i>")
+    lines.append("")
+
+    # 4. Favoritos
     favs = shelves["favorites"]
     lines.append(f"⭐ <b>Mis Favoritos ({len(favs)}):</b>")
     if favs:
-        for f in favs:
+        for f in favs[:8]:
             f_title = html.escape(f.book.title if f.book else "Libro")
             lines.append(f"• ⭐ <b>{f_title}</b>")
+        if len(favs) > 8:
+            lines.append(f"  <i>... y {len(favs) - 8} más</i>")
     else:
         lines.append("<i>(Aún no has marcado libros favoritos)</i>")
     lines.append("")
 
-    finished = shelves["finished"]
-    lines.append(f"🏆 <b>Terminados ({len(finished)}):</b>")
-    if finished:
-        for fin in finished[:5]:
-            fin_title = html.escape(fin.book.title if fin.book else "Libro")
-            lines.append(f"• ✅ <b>{fin_title}</b>")
-        if len(finished) > 5:
-            lines.append(f"  <i>... y {len(finished) - 5} más</i>")
-    else:
-        lines.append("<i>(Aún no has marcado libros terminados)</i>")
-    lines.append("")
-
+    # 5. Por leer
     to_read = shelves["to_read"]
     lines.append(f"📌 <b>Por Leer / Deseos ({len(to_read)}):</b>")
     if to_read:
-        for tr in to_read[:5]:
+        for tr in to_read[:8]:
             tr_title = html.escape(tr.book.title if tr.book else "Libro")
             lines.append(f"• 🔖 <b>{tr_title}</b>")
-        if len(to_read) > 5:
-            lines.append(f"  <i>... y {len(to_read) - 5} más</i>")
+        if len(to_read) > 8:
+            lines.append(f"  <i>... y {len(to_read) - 8} más</i>")
     else:
         lines.append("<i>(Tu lista de deseos está vacía)</i>")
 
     lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 <i>Inicia una lectura conjunta con /leerjuntos o actualiza tu progreso con /progreso.</i>")
+    lines.append("💡 <i>Inicia una lectura conjunta con /leerjuntos o actualiza tu avance con /progreso.</i>")
 
     card_text = "\n".join(lines)
     try:
@@ -3134,7 +3204,7 @@ async def buddy_read_callback_handler(update: Update, context: ContextTypes.DEFA
 
 
 async def reading_state_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja acciones sobre el estante personal (ej. marcar favorito)."""
+    """Maneja acciones sobre el estante personal: favorito, en curso, finalizado, progreso."""
     query = update.callback_query
     if not query or not query.data:
         return
@@ -3165,5 +3235,115 @@ async def reading_state_callback_handler(update: Update, context: ContextTypes.D
             await update_user_book_state(session, user_db.id, book_id, is_favorite=new_fav)
             msg = "⭐ Añadido a tus Favoritos" if new_fav else "Eliminado de tus Favoritos"
             await query.answer(msg)
+
+        elif action == "reading":
+            await update_user_book_state(session, user_db.id, book_id, status="reading")
+            await query.answer("📖 Marcado como: Leyendo Actualmente")
+
+        elif action == "finished":
+            await update_user_book_state(session, user_db.id, book_id, status="finished", progress_percent=100.0)
+            await query.answer("🏆 ¡Felicitaciones! Libro marcado como Terminado (100%)")
+
+        elif action == "prog":
+            prog_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("25%", callback_data=f"rs:setp:{book_id}:25"),
+                    InlineKeyboardButton("50%", callback_data=f"rs:setp:{book_id}:50"),
+                    InlineKeyboardButton("75%", callback_data=f"rs:setp:{book_id}:75"),
+                    InlineKeyboardButton("100%", callback_data=f"rs:setp:{book_id}:100"),
+                ],
+                [
+                    InlineKeyboardButton("🔙 Volver", callback_data=f"rs:back:{book_id}")
+                ]
+            ])
+            try:
+                await query.edit_message_reply_markup(reply_markup=prog_kb)
+            except Exception:
+                pass
+            await query.answer("Selecciona tu avance de lectura:")
+
+        elif action == "setp":
+            pct = float(parts[3])
+            new_st = "finished" if pct >= 100.0 else "reading"
+            await update_user_book_state(session, user_db.id, book_id, status=new_st, progress_percent=pct)
+            await query.answer(f"📊 Progreso actualizado al {pct:.0f}%")
+
+        elif action == "back":
+            back_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📖 Leyendo", callback_data=f"rs:reading:{book_id}"),
+                    InlineKeyboardButton("✅ Leído", callback_data=f"rs:finished:{book_id}"),
+                ],
+                [
+                    InlineKeyboardButton("⭐ Favorito", callback_data=f"rs:fav:{book_id}"),
+                    InlineKeyboardButton("📊 Progreso", callback_data=f"rs:prog:{book_id}"),
+                ],
+                [
+                    InlineKeyboardButton("🤝 Lectura Conjunta", callback_data=f"br:start:{book_id}"),
+                ]
+            ])
+            try:
+                await query.edit_message_reply_markup(reply_markup=back_kb)
+            except Exception:
+                pass
+            await query.answer()
+
+
+async def reorganize_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /reorganizar o /organizar:
+    Detecta automáticamente libros que no están en su tema o que están en General,
+    crea los temas faltantes y los mueve a su tema correspondiente de forma autónoma.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    from app.services.book_sync_service import reorganize_misplaced_books
+
+    status_msg = await message.reply_text(
+        "🔍 <i>Escaneando biblioteca para detectar libros fuera de tema...</i>",
+        parse_mode="HTML"
+    )
+
+    async with AsyncSessionLocal() as session:
+        link = await _get_or_create_link(context.bot, session, chat.id)
+        if not link:
+            await status_msg.edit_text("❌ Este grupo no está vinculado a una biblioteca.", parse_mode="HTML")
+            return
+
+        if not link.forum_enabled:
+            await status_msg.edit_text(
+                "ℹ️ Este grupo no tiene temas/topics habilitados. Activa los temas en el grupo para organizar por géneros.",
+                parse_mode="HTML"
+            )
+            return
+
+        res = await reorganize_misplaced_books(
+            bot=context.bot,
+            session=session,
+            link=link,
+            chat_id=chat.id,
+            force=True
+        )
+
+    moved = res.get("moved_count", 0)
+    misplaced = res.get("misplaced_count", 0)
+
+    if misplaced == 0:
+        await status_msg.edit_text(
+            "✨ <b>¡Biblioteca perfectamente organizada!</b>\nTodos los libros se encuentran en sus temas correspondientes.",
+            parse_mode="HTML"
+        )
+    else:
+        await status_msg.edit_text(
+            f"📦 <b>Reorganización Completada:</b>\n\n"
+            f"• <b>Libros fuera de tema detectados:</b> <code>{misplaced}</code>\n"
+            f"• <b>Libros movidos exitosamente:</b> <code>{moved}</code>\n\n"
+            "🏷️ <i>Todos los libros han sido archivados en sus estantes temáticos.</i>",
+            parse_mode="HTML"
+        )
+
 
 

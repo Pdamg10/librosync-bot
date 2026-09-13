@@ -234,6 +234,7 @@ async def process_book_message(
         source="telegram",
         telegram_link_id=link.id,
         telegram_message_id=target_message_id,
+        telegram_topic_id=assigned_topic_id,
         telegram_file_id=doc.file_id,
         file_unique_id=file_unique_id,
         file_format=ext,

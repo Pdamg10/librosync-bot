@@ -18,6 +18,7 @@ class Book(Base):
     source = Column(String(50), default="telegram")  # 'app' | 'telegram'
     telegram_link_id = Column(Integer, ForeignKey("telegram_links.id", ondelete="SET NULL"), nullable=True)
     telegram_message_id = Column(Integer, nullable=True)
+    telegram_topic_id = Column(Integer, nullable=True)
     telegram_file_id = Column(String(255), nullable=True)
     file_unique_id = Column(String(100), index=True, nullable=True)
     file_format = Column(String(20), default="pdf")  # 'pdf' | 'epub' | 'mobi'

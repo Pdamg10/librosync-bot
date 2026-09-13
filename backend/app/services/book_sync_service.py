@@ -276,3 +276,89 @@ async def sync_all_library_for_chat(
         "message": f"Sincronización exitosa: {active_books} libros en {active_topics_count} estantes."
     }
 
+
+async def reorganize_misplaced_books(
+    bot: Bot,
+    session: AsyncSession,
+    link: TelegramLink,
+    chat_id: int,
+    force: bool = False,
+    threshold: int = 10
+) -> Dict[str, Any]:
+    """
+    Detecta libros que no están en su tema correspondiente y los mueve al topic correcto.
+    Si force=False, solo actúa si la cantidad de libros fuera de tema supera 'threshold' (10 libros).
+    """
+    from app.services.topic_resolver import resolve_or_create_topic
+    from app.services.telegram_service import move_or_repost_to_topic
+
+    if not link.forum_enabled:
+        return {
+            "status": "not_forum",
+            "message": "El grupo no tiene los temas/topics habilitados.",
+            "moved_count": 0,
+            "misplaced_count": 0
+        }
+
+    stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+    b_res = await session.execute(stmt_books)
+    all_books = b_res.scalars().all()
+
+    stmt_topics = select(Topic).where(Topic.telegram_link_id == link.id)
+    t_res = await session.execute(stmt_topics)
+    topic_map = {t.genre: t.topic_id for t in t_res.scalars().all()}
+
+    misplaced = []
+    for b in all_books:
+        target_topic_id = topic_map.get(b.genre)
+        if b.telegram_topic_id is None or (target_topic_id and b.telegram_topic_id != target_topic_id):
+            misplaced.append(b)
+
+    misplaced_count = len(misplaced)
+    if not force and misplaced_count < threshold:
+        return {
+            "status": "threshold_not_reached",
+            "misplaced_count": misplaced_count,
+            "threshold": threshold,
+            "moved_count": 0
+        }
+
+    moved_count = 0
+    for b in misplaced:
+        try:
+            target_topic_id = topic_map.get(b.genre)
+            if not target_topic_id:
+                target_topic_id = await resolve_or_create_topic(
+                    session=session,
+                    bot=bot,
+                    telegram_link=link,
+                    genre=b.genre
+                )
+                topic_map[b.genre] = target_topic_id
+
+            if target_topic_id and b.telegram_message_id:
+                reposted_id = await move_or_repost_to_topic(
+                    bot=bot,
+                    chat_id=chat_id,
+                    message_id=b.telegram_message_id,
+                    topic_id=target_topic_id,
+                    delete_original=link.bot_is_admin
+                )
+                if reposted_id:
+                    b.telegram_message_id = reposted_id
+                    b.telegram_topic_id = target_topic_id
+                    moved_count += 1
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Error reorganizando libro {b.id} ({b.title}): {e}")
+
+    await session.commit()
+
+    return {
+        "status": "success",
+        "misplaced_count": misplaced_count,
+        "moved_count": moved_count,
+        "threshold": threshold
+    }
+
+

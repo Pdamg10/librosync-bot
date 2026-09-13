@@ -36,6 +36,7 @@ from app.bot.handlers import (
     help_handler,
     chat_member_update_handler,
     sync_handler,
+    reorganize_command_handler,
     info_handler,
     buddy_read_handler,
     my_books_handler,
@@ -57,20 +58,19 @@ async def setup_bot_commands(bot):
     """Registra el menú de comandos en Telegram para autocompletado nativo en chats privados, grupos y administradores."""
     try:
         commands = [
-            BotCommand("leerjuntos", "Iniciar o unirse a una lectura conjunta"),
-            BotCommand("mislibros", "Ver mis estantes: leyendo, favoritos, por leer"),
-            BotCommand("progreso", "Actualizar mi porcentaje de lectura actual"),
-            BotCommand("info", "Ficha de saga, continuación y co-lectores"),
+            BotCommand("buscar", "Buscar libros por título o autor"),
             BotCommand("libros", "Ver catálogo de libros disponibles"),
-            BotCommand("buscar", "Buscar libros en la biblioteca actual"),
-            BotCommand("temas", "Ver todos los temas y géneros"),
-            BotCommand("indice", "Publicar índice de libros en este tema"),
+            BotCommand("temas", "Ver temas y géneros disponibles"),
+            BotCommand("indice", "Publicar índice de este tema"),
             BotCommand("descargar", "Buscar y descargar libros a la biblioteca"),
+            BotCommand("leerjuntos", "Iniciar o unirse a una lectura conjunta"),
+            BotCommand("mislibros", "Mi perfil: leídos, leyendo, progreso y conjuntas"),
+            BotCommand("progreso", "Actualizar mi porcentaje de lectura actual"),
+            BotCommand("info", "Ficha del libro, estante y acciones"),
+            BotCommand("registrar", "Registrar libro respondiendo a su mensaje"),
+            BotCommand("reorganizar", "Mover libros fuera de tema a su estante"),
             BotCommand("deduplicar", "Eliminar libros duplicados automáticamente"),
-            BotCommand("sincronizar", "Depurar libros eliminados y sincronizar biblioteca"),
-            BotCommand("registrar", "Registrar un libro respondiendo a su mensaje"),
-            BotCommand("renombrar", "Corregir título o autor de un libro"),
-            BotCommand("settopic", "Vincular este tema a un género"),
+            BotCommand("sincronizar", "Mantenimiento general de la biblioteca"),
             BotCommand("help", "Mostrar ayuda y comandos disponibles"),
         ]
         await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
@@ -108,6 +108,7 @@ def get_bot_application() -> Application:
         _bot_application.add_handler(CommandHandler("indice", topic_index_handler))
         _bot_application.add_handler(CommandHandler(["deduplicar", "dedup"], deduplicate_command_handler))
         _bot_application.add_handler(CommandHandler(["sincronizar", "limpiar", "sync"], sync_handler))
+        _bot_application.add_handler(CommandHandler(["reorganizar", "organizar", "mover"], reorganize_command_handler))
         _bot_application.add_handler(CommandHandler("registrar", register_reply_handler))
         _bot_application.add_handler(CommandHandler("indexar", register_reply_handler))
         _bot_application.add_handler(CommandHandler(["renombrar", "editar"], rename_book_handler))

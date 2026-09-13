@@ -59,5 +59,7 @@ async def init_db():
                     sync_conn.execute(text("ALTER TABLE books ADD COLUMN next_book VARCHAR(255);"))
                 if "has_sequel" not in cols:
                     sync_conn.execute(text("ALTER TABLE books ADD COLUMN has_sequel BOOLEAN;"))
+                if "telegram_topic_id" not in cols:
+                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN telegram_topic_id INTEGER;"))
 
         await conn.run_sync(_migrate_columns)
