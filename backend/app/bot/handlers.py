@@ -110,12 +110,14 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("👥 Biblioteca de Grupo", callback_data="setup_mode:group")],
             ]
             welcome_text = (
-                f"👋 <b>¡Hola, {user_name}! Soy Griffin, tu bibliotecario digital inteligente.</b>\n\n"
-                "📚 ¿Cómo deseas utilizarme hoy?\n\n"
-                "1️⃣ <b>Biblioteca Personal:</b>\n"
-                "Guarda, organiza y consulta tus libros directamente en este chat privado. Envíame cualquier PDF o EPUB y armaré tu catálogo personal.\n\n"
-                "2️⃣ <b>Biblioteca de Grupo:</b>\n"
-                "Organiza la biblioteca de tu club de lectura o comunidad en un grupo con <b>Temas/Topics</b>. Generaremos un <b>código único de vinculación</b> con la vigencia que tú elijas.\n\n"
+                f"✨ <b>¡Hola, {user_name}! Bienvenido a Griffin</b> 📖\n"
+                "<i>Tu bibliotecario digital inteligente y compañero de lectura.</i>\n\n"
+                "Estoy aquí para gestionar tu colección de libros, organizar clubes de lectura y acompañarte en cada página sin complicaciones.\n\n"
+                "<b>¿Cómo deseas utilizarme?</b>\n\n"
+                "👤 <b>Biblioteca Personal:</b>\n"
+                "Tu espacio privado. Envíame cualquier PDF o EPUB a este chat y armaré tu catálogo exclusivo, con registro de avance y estantes personales.\n\n"
+                "👥 <b>Biblioteca de Grupo:</b>\n"
+                "La biblioteca de tu comunidad o club de lectura. Generaremos un <b>código único de vinculación</b> para organizar los libros por temas/géneros y leer en equipo con aislamiento total de datos.\n\n"
                 "👇 <i>Selecciona una opción para comenzar:</i>"
             )
             await message.reply_text(welcome_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -138,29 +140,31 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     safe_title = html.escape(existing_link.chat_title or chat.title or "Grupo")
                     msg = (
-                        f"📚 <b>Biblioteca Activa: '{safe_title}'</b>\n\n"
-                        f"• <b>Libros registrados en este grupo:</b> {total_books}\n"
-                        f"• <b>Temas/Estantes configurados:</b> {total_topics}\n"
-                        f"• <b>Aislamiento de datos:</b> ✅ 100% independiente y protegido\n\n"
-                        "📖 <i>Comandos disponibles:</i>\n"
-                        "• <code>/libros</code> — Ver catálogo interactivo del grupo\n"
-                        "• <code>/buscar &lt;título&gt;</code> — Buscar libros en este grupo\n"
-                        "• <code>/temas</code> — Ver géneros y estantes disponibles\n"
+                        f"👋 <b>¡Hola a todos! Soy Griffin, el bibliotecario de '{safe_title}'</b> 📚✨\n\n"
+                        f"• 📖 <b>Libros registrados:</b> {total_books} obras\n"
+                        f"• 🏷️ <b>Estantes temáticos:</b> {total_topics} géneros activos\n"
+                        f"• 🔒 <b>Privacidad:</b> Biblioteca aislada y protegida al 100%\n\n"
+                        "🚀 <b>Comandos rápidos:</b>\n"
+                        "• <code>/buscar &lt;título o autor&gt;</code> — Buscar libros en el catálogo\n"
+                        "• <code>/libros</code> — Ver catálogo interactivo de este grupo\n"
+                        "• <code>/temas</code> — Ver estantes temáticos disponibles\n"
                         "• <code>/leerjuntos</code> — Iniciar o unirse a una lectura conjunta\n"
-                        "• <code>/help</code> — Ver guía de comandos\n\n"
-                        "✨ ¡Sube cualquier archivo PDF o EPUB al chat y Griffin lo catalogará y reubicará automáticamente!"
+                        "• <code>/mislibros</code> — Ver mi perfil de lector y co-lectores\n"
+                        "• <code>/help</code> — Ver guía completa de comandos\n\n"
+                        "✨ <i>¡Sube o reenvía cualquier PDF o EPUB al chat y Griffin lo catalogará y archivará en su tema correspondiente al instante!</i>"
                     )
                     await message.reply_text(msg, parse_mode="HTML")
                     return
                 else:
                     bot_username = (await bot.get_me()).username
                     msg = (
-                        "⚠️ <b>Este grupo aún no está vinculado a una biblioteca.</b>\n\n"
-                        "Para activar la biblioteca inteligente en este grupo:\n"
-                        f"1. Abre el chat privado con @{bot_username}.\n"
+                        "👋 <b>¡Saludos! Soy Griffin, tu bibliotecario digital inteligente.</b> 📚✨\n\n"
+                        "Para activar y vincular la biblioteca comunitaria de este grupo:\n"
+                        f"1. Abre un chat privado con @{bot_username}.\n"
                         "2. Envía <code>/start</code> y selecciona <b>'👥 Biblioteca de Grupo'</b>.\n"
-                        "3. Elige la vigencia y usa el código o enlace generado.\n\n"
-                        "O si ya tienes un código, escribe en este grupo: <code>/start &lt;CODIGO&gt;</code>"
+                        "3. Elige la duración del código de vinculación y envíalo aquí con:\n"
+                        "<code>/start &lt;CÓDIGO&gt;</code>\n\n"
+                        "💡 <i>Recomendación: Activa los <b>Temas/Topics</b> en este grupo y concédeme permisos de administrador para clasificar y mover los libros por género automáticamente.</i>"
                     )
                     await message.reply_text(msg, parse_mode="HTML")
                     return
@@ -2567,27 +2571,26 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thread_id = getattr(message, "message_thread_id", None)
     help_text = (
-        "🤖 <b>Comandos Disponibles:</b>\n\n"
-        "📚 <b>Biblioteca & Catálogo:</b>\n"
-        "• <code>/info &lt;libro o autor&gt;</code> — Ficha detallada: saga/trilogía, continuación, libros anteriores/siguientes y temas.\n"
-        "• <code>/descargar &lt;libro o autor&gt;</code> — Busca y descarga libros externos (EPUB/PDF) a la biblioteca.\n"
-        "• <code>/buscar &lt;nombre o autor&gt;</code> — Encuentra libros en el catálogo existente.\n"
-        "• <code>/libros</code> o <code>/catalogo</code> — Catálogo paginado con título, autor, publicación y tema.\n"
-        "• <code>/temas</code> — Ver todos los géneros registrados con conteo de libros.\n"
-        "• <code>/indice</code> — <i>(Dentro de un tema)</i> Genera la lista de libros de ese tema para fijar.\n\n"
-        "👥 <b>Club de Lectura:</b>\n"
-        "• <code>/leerjuntos &lt;libro&gt;</code> — Iniciar o unirse a una lectura conjunta con tarjeta interactiva.\n"
-        "• <code>/mislibros</code> — Ver tus estantes personales: Leyendo, Favoritos, Terminados y Por Leer.\n"
-        "• <code>/progreso &lt;%&gt;</code> — Actualizar tu avance de lectura en tiempo real.\n\n"
-        "⚙️ <b>Administración & Organización:</b>\n"
-        "• <code>/deduplicar</code> — Escanea y elimina libros duplicados automáticamente en Telegram y catálogo.\n"
-        "• <code>/sincronizar</code> o <code>/limpiar</code> — Depura libros eliminados, audita extraviados y actualiza estantes.\n"
-        "• <code>/registrar</code> — Responde a un mensaje antiguo con PDF o EPUB para indexarlo (o <code>/registrar Título - Autor</code>).\n"
-        "• <code>/renombrar &lt;Título&gt; - &lt;Autor&gt;</code> — Corrige el título o autor de un libro respondiendo a su mensaje.\n"
-        "• <code>/settopic &lt;Género&gt;</code> — <i>(Dentro de un tema)</i> Asigna ese tema manualmente a un género.\n"
-        "• <code>/start</code> — Menú interactivo de inicio y vinculación de biblioteca personal o de grupo.\n"
-        "• <code>/help</code> — Ver este menú de ayuda.\n\n"
-        "✨ <b>Modo Cero Fricción:</b> No necesitas comandos para libros nuevos: ¡solo envía cualquier PDF o EPUB al chat y Griffin se encarga de todo!"
+        "🤖 <b>Guía Oficial de Comandos de Griffin:</b>\n\n"
+        "📚 <b>Exploración & Catálogo:</b>\n"
+        "• <code>/buscar &lt;término&gt;</code> — Encuentra libros por título, autor o saga.\n"
+        "• <code>/libros</code> — Explora el catálogo interactivo de la biblioteca.\n"
+        "• <code>/temas</code> — Lista de géneros y estantes con conteo de obras.\n"
+        "• <code>/indice</code> — <i>(Dentro de un tema)</i> Publica el índice interactivo de ese género.\n"
+        "• <code>/info &lt;libro&gt;</code> — Ficha completa con botones de lectura y co-lectores.\n"
+        "• <code>/descargar &lt;título&gt;</code> — Busca y descarga libros de repositorios abiertos (Internet Archive, Gutenberg).\n\n"
+        "👥 <b>Club de Lectura & Progreso:</b>\n"
+        "• <code>/leerjuntos &lt;libro&gt;</code> — Inicia o únete a una lectura conjunta con tus compañeros.\n"
+        "• <code>/mislibros</code> — Tu perfil de lector: libros terminados, lecturas activas, avance y co-lectores.\n"
+        "• <code>/progreso &lt;porcentaje&gt;</code> — Actualiza tu porcentaje de lectura en curso (ej. <code>/progreso 45%</code>).\n\n"
+        "⚙️ <b>Gestión & Mantenimiento:</b>\n"
+        "• <code>/registrar</code> — Responde a cualquier libro antiguo para indexarlo y clasificarlo con IA.\n"
+        "• <code>/reorganizar</code> — Mueve automáticamente libros fuera de tema a su estante correspondiente.\n"
+        "• <code>/deduplicar</code> — Detecta y elimina copias duplicadas de la biblioteca.\n"
+        "• <code>/sincronizar</code> — Mantenimiento integral, depuración y verificación de estantes.\n"
+        "• <code>/start</code> — Menú inicial para biblioteca personal o vincular grupo.\n"
+        "• <code>/help</code> — Muestra este menú de ayuda.\n\n"
+        "✨ <b>Modo Cero Fricción:</b> No necesitas comandos para subir libros nuevos: ¡simplemente envía o reenvía cualquier archivo PDF o EPUB al chat y Griffin se encarga de clasificarlo y archivarlo solo!"
     )
     try:
         await context.bot.send_message(
