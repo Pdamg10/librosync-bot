@@ -59,27 +59,41 @@ async def run_bot():
     logger.info("Iniciando bot de Telegram (Griffin / LibroSync) en modo servicio puro...")
 
     started = False
-    for attempt in range(3):
+    for attempt in range(1, 11):
         try:
-            await bot_app.initialize()
-            await bot_app.start()
+            if not getattr(bot_app, "_initialized", False):
+                await bot_app.initialize()
+            if not getattr(bot_app, "_running", False):
+                await bot_app.start()
+
+            # Descartar webhooks residuales y purgar conflictos previos
+            try:
+                await bot_app.bot.delete_webhook(drop_pending_updates=True)
+            except Exception:
+                pass
+
             await setup_bot_commands(bot_app.bot)
-            await bot_app.updater.start_polling(drop_pending_updates=False)
+            await bot_app.updater.start_polling(drop_pending_updates=True)
             logger.info("✅ Bot de Telegram en línea y escuchando actualizaciones.")
             started = True
             break
         except Exception as e:
-            logger.warning(f"Intento {attempt + 1}/3 para iniciar el bot de Telegram falló: {e}. Reintentando en 3s...")
-            await asyncio.sleep(3)
+            err_str = str(e).lower()
+            wait_sec = 4
+            if "conflict" in err_str:
+                logger.warning(f"Telegram 409 Conflict detectado (contenedor previo en Render apagándose). Esperando {wait_sec}s (intento {attempt}/10)...")
+            else:
+                logger.warning(f"Intento {attempt}/10 para iniciar el bot de Telegram falló: {e}. Reintentando en {wait_sec}s...")
+            await asyncio.sleep(wait_sec)
 
     if not started:
-        logger.error("No se pudo iniciar el bot de Telegram tras 3 intentos. Abortando.")
+        logger.error("No se pudo iniciar el bot de Telegram tras 10 intentos. Abortando.")
         if health_server:
             health_server.close()
             await health_server.wait_closed()
         return
 
-    # 3. Mantener servicio vivo y gestionar señales de parada (SIGINT, SIGTERM)
+    # 3. Watchdog Activo: Mantener servicio vivo y revivir polling automáticamente
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -90,7 +104,26 @@ async def run_bot():
             pass
 
     try:
-        await stop_event.wait()
+        while not stop_event.is_set():
+            try:
+                # Comprobar si el updater se detuvo por un 409 o desconexión transitoria
+                if bot_app.updater and not bot_app.updater.running and not stop_event.is_set():
+                    logger.warning("⚠️ Updater de Telegram detenido inesperadamente. Reiniciando polling en 5s...")
+                    await asyncio.sleep(5)
+                    if not stop_event.is_set():
+                        try:
+                            await bot_app.bot.delete_webhook(drop_pending_updates=True)
+                            await bot_app.updater.start_polling(drop_pending_updates=True)
+                            logger.info("✅ Polling de Telegram restablecido exitosamente por watchdog.")
+                        except Exception as restart_err:
+                            logger.warning(f"Reintento de polling fallido: {restart_err}")
+            except Exception as watchdog_err:
+                logger.error(f"Error en watchdog del bot: {watchdog_err}")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
     finally:
         logger.info("Deteniendo bot de Telegram de forma controlada...")
         if bot_app.updater and bot_app.updater.running:

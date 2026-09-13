@@ -134,6 +134,16 @@ def get_bot_application() -> Application:
         # Evento de unión o promoción del bot en grupos
         _bot_application.add_handler(ChatMemberHandler(chat_member_update_handler, ChatMemberHandler.MY_CHAT_MEMBER))
 
+        # Gestor de errores global para prevenir caídas silenciosas
+        async def bot_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+            err = context.error
+            logger.error(f"Excepción en bot de Telegram: {err}", exc_info=err)
+            from telegram.error import Conflict
+            if isinstance(err, Conflict):
+                logger.warning("⚠️ Telegram 409 Conflict detectado en handler. El watchdog supervisará la reconexión.")
+
+        _bot_application.add_error_handler(bot_error_handler)
+
         logger.info("Todos los handlers del bot de Telegram registrados exitosamente.")
     return _bot_application
 
