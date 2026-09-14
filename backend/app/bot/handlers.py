@@ -1294,19 +1294,29 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
             _download_cache.pop(k, None)
 
     try:
-        results = await search_external_books(raw_query, max_results=5)
+        results = await asyncio.wait_for(search_external_books(raw_query, max_results=5), timeout=10.0)
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout de 10s en /descargar para '{raw_query}'")
+        results = []
     except Exception as e:
         logger.error(f"Error buscando libros externos: {e}")
-        await status_msg.edit_text(f"❌ Error al consultar los repositorios: {str(e)[:200]}", parse_mode="HTML")
+        try:
+            await status_msg.edit_text(f"❌ Error al consultar los repositorios: {str(e)[:200]}", parse_mode="HTML")
+        except Exception:
+            pass
         return
 
     if not results:
         no_res = (
             f"❌ <b>No se encontraron libros para:</b> <i>\"{html.escape(raw_query)}\"</i>\n\n"
-            "• Intenta con el título exacto o el nombre del autor en español.\n"
-            "• La búsqueda abarca Internet Archive, Project Gutenberg y Library Genesis."
+            "💡 <b>Consejos de búsqueda:</b>\n"
+            "• Intenta con palabras clave o sólo el apellido del autor (ej. <code>/descargar Principito</code> o <code>/descargar García Márquez</code>).\n"
+            "• También puedes subir tu propio archivo (PDF o EPUB) directamente al chat y Griffin lo clasificará y archivará automáticamente con IA."
         )
-        await status_msg.edit_text(no_res, parse_mode="HTML")
+        try:
+            await status_msg.edit_text(no_res, parse_mode="HTML")
+        except Exception:
+            pass
         return
 
     token = hashlib.md5(f"{chat.id}:{raw_query}:{time.time()}".encode()).hexdigest()[:8]
