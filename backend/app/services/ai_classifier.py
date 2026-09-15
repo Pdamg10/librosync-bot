@@ -445,13 +445,13 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
     # Cadena de modelos de respaldo para garantizar alta disponibilidad
     models_to_try = [
         settings.GEMINI_MODEL,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash"
+        "gemini-2.5-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash",
+        "gemini-flash-latest"
     ]
     seen_models = set()
-    model_chain = [m for m in models_to_try if not (m in seen_models or seen_models.add(m))]
+    model_chain = [m for m in models_to_try if m and not (m in seen_models or seen_models.add(m))]
 
     for model in model_chain:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.GEMINI_API_KEY}"
@@ -464,7 +464,7 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con este esquema:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(url, json=payload)
                 if response.status_code == 200:
                     data = response.json()

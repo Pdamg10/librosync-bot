@@ -91,9 +91,9 @@ def get_bot_application() -> Application:
             ApplicationBuilder()
             .token(settings.TELEGRAM_BOT_TOKEN)
             .connect_timeout(30.0)
-            .read_timeout(30.0)
-            .write_timeout(30.0)
-            .pool_timeout(30.0)
+            .read_timeout(120.0)
+            .write_timeout(120.0)
+            .pool_timeout(60.0)
             .build()
         )
         # Registrar comandos

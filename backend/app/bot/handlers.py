@@ -1385,11 +1385,10 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
 
     chosen_book = results[idx]
     title_safe = html.escape(chosen_book["title"])
-    fmt = chosen_book["format"].upper()
-
+    fmt = chosen_book.get("format", "epub").upper()
     await query.edit_message_text(
-        f"⏳ <b>Descargando:</b> <i>{title_safe}</i> (<code>.{fmt}</code>)...\n"
-        f"<i>Por favor espera unos segundos mientras se descarga, analiza con IA y se ubica en su tema.</i>",
+        f"⏳ <b>[1/3] Descargando:</b> <i>{title_safe}</i> (<code>.{fmt}</code>)...\n"
+        f"<i>Conectando al repositorio público y descargando archivo binario...</i>",
         parse_mode="HTML"
     )
 
@@ -1412,7 +1411,17 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
             )
             return
 
-        # 2. Ingestar en la biblioteca
+        # 2. Notificar avance a análisis de IA y subida a Telegram
+        try:
+            await query.edit_message_text(
+                f"🧠 <b>[2/3] Analizando y archivando:</b> <i>{title_safe}</i>...\n"
+                f"<i>Extrayendo metadatos, clasificando con IA y ubicando en su tema...</i>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        # 3. Ingestar en la biblioteca
         async with AsyncSessionLocal() as session:
             stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
             res = await session.execute(stmt)
