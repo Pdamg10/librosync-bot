@@ -105,13 +105,14 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
         return results
 
     ia_search_url = "https://archive.org/advancedsearch.php"
-    q_filter = f'mediatype:(texts) AND ({boolean_terms})'
+    # Filtrar explícitamente colecciones con préstamo digital restringido (printdisabled / inlibrary)
+    q_filter = f'mediatype:(texts) AND ({boolean_terms}) AND -collection:(printdisabled) AND -collection:(inlibrary)'
 
     params = {
         "q": q_filter,
         "fl[]": ["identifier", "title", "creator", "year", "format", "downloads"],
         "sort[]": "downloads desc",
-        "rows": str(limit + 2),
+        "rows": str(limit + 4),
         "output": "json"
     }
 
@@ -137,41 +138,59 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
                 year = str(doc.get("year") or "").strip() or None
 
                 try:
-                    meta_url = f"https://archive.org/metadata/{identifier}/files"
-                    meta_resp = await client.get(meta_url, timeout=4.0)
+                    meta_url = f"https://archive.org/metadata/{identifier}"
+                    meta_resp = await client.get(meta_url, timeout=3.5)
                     if meta_resp.status_code != 200:
                         return None
 
-                    files_data = meta_resp.json().get("result", [])
+                    m_json = meta_resp.json()
+                    meta_info = m_json.get("metadata", {})
+                    # Descartar libros de préstamo cerrado / DRM
+                    if (
+                        meta_info.get("access-restricted-item") == "true"
+                        or "printdisabled" in str(meta_info.get("collection", ""))
+                        or "inlibrary" in str(meta_info.get("collection", ""))
+                    ):
+                        return None
+
+                    files_data = m_json.get("files", [])
+                    # Descartar archivos comprimidos masivos o compendios gigantescos
+                    if len(files_data) > 80:
+                        return None
+
                     epub_file = None
                     pdf_file = None
 
                     for f in files_data:
                         fname = f.get("name", "")
                         fmt = f.get("format", "")
-                        if fname.startswith("_") or fname.endswith((".xml", ".sqlite", ".torrent", "_chocr.html.gz", "_daisy.zip", "lcp.epub")):
+                        fname_l = fname.lower()
+                        if (
+                            fname.startswith("_")
+                            or fname_l.endswith((".xml", ".sqlite", ".torrent", "_chocr.html.gz", "_daisy.zip", "lcp.epub", "_encrypted.epub"))
+                        ):
                             continue
 
                         try:
-                            fsize = int(f.get("size", 0))
+                            fsize = int(f.get("size", 0) or 0)
                         except (ValueError, TypeError):
                             fsize = 0
 
                         if fsize > MAX_DOWNLOAD_SIZE_BYTES or fsize < 10000:
                             continue
 
-                        if fmt == "EPUB" or fname.lower().endswith(".epub"):
-                            if not epub_file or fsize > int(epub_file.get("size", 0)):
+                        if fmt == "EPUB" or fname_l.endswith(".epub"):
+                            if not epub_file or fsize > int(epub_file.get("size", 0) or 0):
                                 epub_file = f
-                        elif fmt in ["Text PDF", "Image Container PDF"] or fname.lower().endswith(".pdf"):
-                            if not pdf_file or fsize > int(pdf_file.get("size", 0)):
+                        elif fmt in ["Text PDF", "Image Container PDF"] or fname_l.endswith(".pdf"):
+                            if not pdf_file or fsize > int(pdf_file.get("size", 0) or 0):
                                 pdf_file = f
 
                     chosen = epub_file or pdf_file
                     if chosen:
                         fname = chosen["name"]
                         fmt_clean = "epub" if (chosen.get("format") == "EPUB" or fname.lower().endswith(".epub")) else "pdf"
-                        size_b = int(chosen.get("size", 0))
+                        size_b = int(chosen.get("size", 0) or 0)
                         dl_url = f"https://archive.org/download/{identifier}/{urllib.parse.quote(fname, safe='/')}"
 
                         return {
@@ -190,7 +209,7 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
                     return None
                 return None
 
-            tasks = [_inspect_doc(doc) for doc in docs[:limit + 1]]
+            tasks = [_inspect_doc(doc) for doc in docs[:limit + 3]]
             doc_results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in doc_results:
                 if isinstance(r, dict) and r:
@@ -205,14 +224,14 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
 
 
 async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Busca en Open Library de Internet Archive para rescatar identificadores de títulos modernos."""
+    """Busca en Open Library de Internet Archive títulos libres de acceso público (sin DRM / préstamo cerrado)."""
     results: List[Dict[str, Any]] = []
     _, raw_terms = build_search_terms(query)
     if not raw_terms:
         return results
 
     ol_url = "https://openlibrary.org/search.json"
-    params = {"q": raw_terms, "limit": str(limit + 3)}
+    params = {"q": raw_terms, "limit": str(limit + 5)}
 
     try:
         async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
@@ -223,6 +242,12 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
             docs = resp.json().get("docs", [])
 
             async def _inspect_ol_doc(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                # Filtrar estrictamente solo libros de acceso público real (no DRM ni préstamo borrowable)
+                ebook_access = d.get("ebook_access")
+                is_public_scan = d.get("public_scan_b", False)
+                if ebook_access != "public" and not is_public_scan:
+                    return None
+
                 ia_ids = d.get("ia", [])
                 if not ia_ids:
                     return None
@@ -242,20 +267,30 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
                 first_pub = str(d.get("first_publish_year") or "").strip() or None
 
                 try:
-                    meta_url = f"https://archive.org/metadata/{best_ia}/files"
+                    meta_url = f"https://archive.org/metadata/{best_ia}"
                     meta_resp = await client.get(meta_url, timeout=3.0)
                     if meta_resp.status_code != 200:
                         return None
 
-                    files_data = meta_resp.json().get("result", [])
+                    m_json = meta_resp.json()
+                    meta_info = m_json.get("metadata", {})
+                    if (
+                        meta_info.get("access-restricted-item") == "true"
+                        or "printdisabled" in str(meta_info.get("collection", ""))
+                        or "inlibrary" in str(meta_info.get("collection", ""))
+                    ):
+                        return None
+
+                    files_data = m_json.get("files", [])
                     chosen = None
                     for f in files_data:
                         fname = f.get("name", "")
+                        fname_l = fname.lower()
                         fmt = f.get("format", "")
-                        if fname.endswith(".epub") and not fname.endswith("lcp.epub"):
+                        if fname_l.endswith(".epub") and not fname_l.endswith("lcp.epub"):
                             chosen = (f, "epub")
                             break
-                        elif fmt in ["Text PDF", "Image Container PDF"] or fname.endswith(".pdf"):
+                        elif fmt in ["Text PDF", "Image Container PDF"] or fname_l.endswith(".pdf"):
                             if not chosen:
                                 chosen = (f, "pdf")
 
@@ -281,7 +316,7 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
                     return None
                 return None
 
-            tasks = [_inspect_ol_doc(d) for d in docs[:limit + 3]]
+            tasks = [_inspect_ol_doc(d) for d in docs[:limit + 5]]
             doc_results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in doc_results:
                 if isinstance(r, dict) and r:
@@ -296,54 +331,106 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
 
 
 async def search_project_gutenberg(query: str, limit: int = 2) -> List[Dict[str, Any]]:
-    """Busca libros libres de dominio público en Project Gutenberg vía Gutendex API."""
+    """Busca libros libres de dominio público en Project Gutenberg con alta velocidad y descarga garantizada."""
     results: List[Dict[str, Any]] = []
     clean_q = re.sub(r"[^\w\s]", " ", query).strip()
     if not clean_q:
         return results
 
+    # 1. Búsqueda directa en gutenberg.org (muy rápida y siempre disponible)
+    gutenberg_search_url = "https://www.gutenberg.org/ebooks/search/"
+    params = {"query": clean_q, "submit_search": "Go!"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+
+    try:
+        from bs4 import BeautifulSoup
+        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True, headers=headers, verify=False) as client:
+            resp = await client.get(gutenberg_search_url, params=params)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                book_items = soup.select("li.booklink")
+                for item in book_items[:limit]:
+                    a_link = item.select_one("a.link")
+                    if not a_link or not a_link.get("href"):
+                        continue
+                    href = a_link["href"]
+                    m_id = re.search(r"/ebooks/(\d+)", href)
+                    if not m_id:
+                        continue
+                    ebook_id = m_id.group(1)
+
+                    title_el = item.select_one(".title")
+                    title = title_el.get_text(strip=True) if title_el else "Sin título"
+                    title = re.sub(r"\s*\([A-Za-z]+\)\s*$", "", title).strip()
+
+                    author_el = item.select_one(".subtitle")
+                    author = clean_author_name(author_el.get_text(strip=True) if author_el else "Desconocido")
+
+                    clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
+                    dl_url = f"https://www.gutenberg.org/ebooks/{ebook_id}.epub3.images"
+
+                    results.append({
+                        "source": "Project Gutenberg",
+                        "title": title,
+                        "author": author,
+                        "year": None,
+                        "format": "epub",
+                        "filename": clean_fname,
+                        "size_bytes": 1024 * 1024,
+                        "size_str": "~1.5 MB",
+                        "download_url": dl_url,
+                        "identifier": f"gutenberg_{ebook_id}"
+                    })
+    except Exception as e:
+        logger.debug(f"Aviso buscando directamente en Gutenberg: {e}")
+
+    if results:
+        return results
+
+    # 2. Fallback a Gutendex
     gutendex_url = "https://gutendex.com/books/"
     params = {"search": clean_q}
 
     try:
-        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True, verify=False) as client:
+        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True, verify=False) as client:
             resp = await client.get(gutendex_url, params=params)
-            if resp.status_code != 200:
-                return results
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("results", [])
 
-            data = resp.json()
-            items = data.get("results", [])
+                for item in items[:limit]:
+                    formats = item.get("formats", {})
+                    epub_url = formats.get("application/epub+zip")
+                    if not epub_url:
+                        continue
 
-            for item in items[:limit]:
-                formats = item.get("formats", {})
-                epub_url = formats.get("application/epub+zip")
-                if not epub_url:
-                    continue
+                    authors_raw = item.get("authors", [])
+                    author_name = "Desconocido"
+                    if authors_raw:
+                        author_name = clean_author_name(authors_raw[0].get("name", "Desconocido"))
 
-                authors_raw = item.get("authors", [])
-                author_name = "Desconocido"
-                if authors_raw:
-                    author_name = clean_author_name(authors_raw[0].get("name", "Desconocido"))
+                    title = item.get("title", "Sin título")
+                    title = re.sub(r"\s+", " ", title).strip()
+                    clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
 
-                title = item.get("title", "Sin título")
-                title = re.sub(r"\s+", " ", title).strip()
-                clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
-
-                results.append({
-                    "source": "Project Gutenberg",
-                    "title": title,
-                    "author": author_name,
-                    "year": None,
-                    "format": "epub",
-                    "filename": clean_fname,
-                    "size_bytes": 1024 * 1024,
-                    "size_str": "~1.5 MB",
-                    "download_url": epub_url,
-                    "identifier": f"gutenberg_{item.get('id')}"
-                })
+                    results.append({
+                        "source": "Project Gutenberg",
+                        "title": title,
+                        "author": author_name,
+                        "year": None,
+                        "format": "epub",
+                        "filename": clean_fname,
+                        "size_bytes": 1024 * 1024,
+                        "size_str": "~1.5 MB",
+                        "download_url": epub_url,
+                        "identifier": f"gutenberg_{item.get('id')}"
+                    })
 
     except Exception as e:
-        logger.warning(f"Aviso buscando en Gutendex: {e}")
+        logger.debug(f"Aviso buscando en Gutendex fallback: {e}")
 
     return results
 
@@ -401,24 +488,50 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                         continue
 
                     title_a = row.find("a", href=lambda h: h and "edition.php" in h) or row.find("a")
-                    title = re.sub(r"\s+", " ", title_a.get_text(strip=True) if title_a else "Libro").strip()
+                    if title_a:
+                        for itag in title_a.find_all("i"):
+                            itag.decompose()
+                        title = re.sub(r"\s+", " ", title_a.get_text(strip=True)).strip()
+                    else:
+                        title = "Libro"
+
                     author = clean_author_name(tds[1].get_text(strip=True) if len(tds) > 1 else "Desconocido")
+
+                    # Extraer año (columna 4 / índice 3)
+                    year = None
+                    if len(tds) > 3:
+                        year_raw = tds[3].get_text(strip=True)
+                        if year_raw:
+                            y_match = re.search(r"\b(19\d\d|20\d\d)\b", year_raw)
+                            year = y_match.group(1) if y_match else (year_raw if year_raw.isdigit() else None)
+
+                    # Extraer tamaño (columna 7 / índice 6)
+                    size_text = tds[6].get_text(strip=True) if len(tds) > 6 else ""
+                    size_bytes = parse_libgen_size(size_text) if size_text else 2 * 1024 * 1024
+                    if size_bytes > MAX_DOWNLOAD_SIZE_BYTES:
+                        continue
+                    size_str = size_text or format_size(size_bytes)
 
                     ads_href = ads_a["href"]
                     ads_url = urllib.parse.urljoin(mirror, ads_href)
+
+                    # Obtener hash MD5
+                    md5_match = re.search(r"md5=([a-fA-F0-9]{32})", ads_href)
+                    md5_id = md5_match.group(1) if md5_match else f"{abs(hash(title))}"
+
                     clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:45].strip().replace(' ', '_')}.{fmt}"
 
                     m_results.append({
                         "source": "Library Genesis",
                         "title": title,
                         "author": author,
-                        "year": None,
+                        "year": year,
                         "format": fmt,
                         "filename": clean_fname,
-                        "size_bytes": 2 * 1024 * 1024,
-                        "size_str": "Directo",
+                        "size_bytes": size_bytes,
+                        "size_str": size_str,
                         "download_url": ads_url,
-                        "identifier": f"libgen_{hash(title)}",
+                        "identifier": f"libgen_{md5_id}",
                         "is_libgen": True
                     })
                     if len(m_results) >= limit:
@@ -524,12 +637,14 @@ async def download_book_bytes(download_url: str) -> Tuple[bytes, str]:
             req_headers["Referer"] = download_url
 
         resp = await client.get(target_url, headers=req_headers)
+        if resp.status_code == 403:
+            raise RuntimeError("El archivo en el repositorio de origen requiere préstamo digital o acceso restringido por derechos de autor. Selecciona otra opción de la lista o sube tu archivo directamente.")
         if resp.status_code != 200:
             raise RuntimeError(f"El servidor de origen respondió con código {resp.status_code}")
 
         content_bytes = resp.content
-        if len(content_bytes) < 1000:
-            raise ValueError("El archivo descargado está vacío o corrupto (tamaño menor a 1 KB).")
+        if len(content_bytes) < 20:
+            raise ValueError("El archivo descargado está vacío o corrupto.")
 
         # Comprobar que no sea una página HTML de error disfrazada de EPUB/PDF
         first_bytes = content_bytes[:200].lstrip().lower()

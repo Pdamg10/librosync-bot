@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 import re
 import html
@@ -847,10 +848,15 @@ async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 topic_id_val = thread_id
 
         # Consultar libros con aislamiento estricto por biblioteca/chat
+        book_filter = (
+            or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
+            if link.chat_type == "private"
+            else (Book.telegram_link_id == link.id)
+        )
         stmt_books = (
             select(Book)
             .options(selectinload(Book.telegram_link))
-            .where(Book.telegram_link_id == link.id)
+            .where(book_filter)
         )
 
         if topic_filter:
@@ -945,10 +951,15 @@ async def catalog_callback_handler(update: Update, context: ContextTypes.DEFAULT
             if topic_obj:
                 topic_filter = topic_obj.genre
 
+        book_filter = (
+            or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
+            if link.chat_type == "private"
+            else (Book.telegram_link_id == link.id)
+        )
         stmt_books = (
             select(Book)
             .options(selectinload(Book.telegram_link))
-            .where(Book.telegram_link_id == link.id)
+            .where(book_filter)
         )
 
         if topic_filter:
@@ -1533,7 +1544,12 @@ async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         topics = t_res.scalars().all()
 
         # Contar libros por tema con aislamiento estricto
-        stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        book_filter = (
+            or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
+            if link.chat_type == "private"
+            else (Book.telegram_link_id == link.id)
+        )
+        stmt_books = select(Book).where(book_filter)
         b_res = await session.execute(stmt_books)
         all_books = b_res.scalars().all()
 
@@ -2868,7 +2884,7 @@ async def my_books_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     u_name = html.escape(user_tg.first_name or user_tg.username or "Lector")
     lines = [
-        f"📚 <b>Perfil de Lectura de {u_name}</b>",
+        f"📚 <b>Estantes de Lectura de {u_name}</b>",
         f"<i>(Total en seguimiento: {shelves['total_tracked']} obras)</i>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
