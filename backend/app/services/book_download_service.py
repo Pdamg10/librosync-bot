@@ -3,6 +3,7 @@ import re
 import logging
 import asyncio
 import urllib.parse
+import zipfile
 from typing import List, Dict, Any, Optional, Tuple
 import httpx
 from telegram import Bot
@@ -14,13 +15,138 @@ from app.models.telegram_link import TelegramLink
 from app.models.topic import Topic
 from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug
 from app.services.ai_classifier import classify_book_with_gemini, get_genre_emoji
-from app.services.metadata_extractor import extract_internal_book_metadata
+from app.services.metadata_extractor import extract_internal_book_metadata, is_generic_or_cryptic_filename
 from app.services.telegram_service import send_book_document
 from app.services.series_formatter import format_book_full_description
 
 logger = logging.getLogger(__name__)
 
 MAX_DOWNLOAD_SIZE_BYTES = 48 * 1024 * 1024  # 48 MB (Telegram Bot limit is 50MB)
+
+SUPPORTED_BOOK_FORMATS = {"epub", "pdf", "mobi", "azw3", "cbr", "cbz"}
+_PLACEHOLDER_METADATA = {
+    "", "desconocido", "desconocida", "unknown", "sin titulo", "sin título",
+    "none", "null", "n/a", "no disponible",
+}
+
+
+def _normalized_extension(filename: str) -> str:
+    """Devuelve la extensión real de un nombre de archivo, sin parámetros de URL."""
+    clean = urllib.parse.unquote((filename or "").split("?", 1)[0]).strip()
+    clean = clean.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in clean:
+        return ""
+    return clean.rsplit(".", 1)[-1].lower()
+
+
+def detect_book_format(
+    content_bytes: bytes,
+    filename: str = "",
+    expected_format: Optional[str] = None
+) -> str:
+    """
+    Detecta el formato real del archivo por su firma binaria en lugar de confiar
+    ciegamente en la URL. Algunos repositorios entregan nombres como
+    '2000.epub3.images' aunque el contenido sea un EPUB válido.
+    """
+    head = (content_bytes or b"")[:1024].lstrip()
+
+    if head.startswith(b"%PDF"):
+        return "pdf"
+
+    if head.startswith(b"PK\x03\x04"):
+        # Un ZIP puede ser EPUB o CBZ. Comprobamos el mimetype/estructura EPUB
+        # y, si no es concluyente, usamos el nombre o el formato esperado.
+        try:
+            with zipfile.ZipFile(io.BytesIO(content_bytes)) as zf:
+                names = set(zf.namelist())
+                if "mimetype" in names:
+                    mime = zf.read("mimetype")[:80].lower()
+                    if b"epub" in mime:
+                        return "epub"
+                if "META-INF/container.xml" in names:
+                    return "epub"
+        except Exception:
+            pass
+
+        for value in (filename, expected_format or ""):
+            ext = _normalized_extension(value) if "." in (value or "") else (value or "").lower()
+            if ext in {"cbz", "cbr"}:
+                return ext
+        # La mayoría de los ZIP descargados de repositorios de libros son EPUB,
+        # incluso cuando la URL los etiqueta erróneamente como PDF.
+        return "epub"
+
+    ext = _normalized_extension(filename)
+    if ext in SUPPORTED_BOOK_FORMATS:
+        return ext
+
+    expected = (expected_format or "").lower().lstrip(".")
+    if expected in SUPPORTED_BOOK_FORMATS:
+        return expected
+
+    return ""
+
+
+def normalize_download_filename(filename: str, detected_format: str = "epub") -> str:
+    """Limpia nombres de descarga como '2000.epub3.images' -> '2000.epub'."""
+    clean = urllib.parse.unquote((filename or "").split("?", 1)[0]).strip()
+    clean = clean.replace("\\", "/").rsplit("/", 1)[-1]
+
+    if not clean:
+        return f"libro_descargado.{detected_format or 'epub'}"
+
+    detected = (detected_format or "").lower().lstrip(".")
+    lower = clean.lower()
+    for suffix in (".epub3.images", ".epub.images", ".epub.noimages", ".epub3"):
+        if lower.endswith(suffix):
+            clean = clean[: -len(suffix)].rstrip(" ._-") or "libro_descargado"
+            return f"{clean}.{detected or 'epub'}"
+
+    ext = _normalized_extension(clean)
+    if ext in SUPPORTED_BOOK_FORMATS:
+        if detected and ext != detected:
+            return f"{clean[: -(len(ext) + 1)]}.{detected}"
+        return clean
+
+    # Quitar sufijos técnicos habituales antes de añadir la extensión correcta.
+    clean = re.sub(
+        r"(?:\.(?:images|noimages|epub\d*|pdf\d*|bin|dat|tmp|download|html?|php))+$",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    ).rstrip(" ._-")
+    if not clean:
+        clean = "libro_descargado"
+    return f"{clean}.{detected_format or 'epub'}"
+
+
+def build_book_filename(title: str, author: str, file_format: str) -> str:
+    """Construye un nombre seguro y de longitud limitada para enviarlo a Telegram."""
+    def _sanitize(value: str, limit: int, fallback: str) -> str:
+        clean = re.sub(r"[^a-zA-Z0-9À-ÿ_\-. ]", "", str(value or "")).strip(" ._-")
+        clean = re.sub(r"\s+", " ", clean)
+        return (clean[:limit].rstrip(" ._-") or fallback)
+
+    safe_title = _sanitize(title, 90, "Libro")
+    safe_author = _sanitize(author, 60, "Desconocido")
+    return f"{safe_title} - {safe_author}.{file_format or 'epub'}"
+
+
+def _is_placeholder_metadata(value: Any) -> bool:
+    return not isinstance(value, str) or value.strip().lower() in _PLACEHOLDER_METADATA
+
+
+def _clean_meta_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _looks_like_generic_title(title: str, file_format: str = "epub") -> bool:
+    """Detecta títulos que en realidad son el nombre críptico del archivo."""
+    if _is_placeholder_metadata(title):
+        return True
+    candidate = title if "." in title else f"{title}.{file_format}"
+    return is_generic_or_cryptic_filename(candidate)
 
 LIBGEN_MIRRORS = [
     "https://libgen.is",
@@ -85,16 +211,168 @@ def format_size(size_bytes: int) -> str:
 
 
 def clean_author_name(raw_name: Any) -> str:
-    """Convierte 'Cervantes Saavedra, Miguel de' a 'Miguel de Cervantes Saavedra' y maneja listas."""
+    """Limpia autores: 'Cervantes Saavedra, Miguel de, 1547-1616' -> 'Miguel de Cervantes Saavedra'."""
     if not raw_name:
         return "Desconocido"
-    if isinstance(raw_name, list):
+    if isinstance(raw_name, (list, tuple)):
         raw_name = raw_name[0] if raw_name else "Desconocido"
-    raw_name = str(raw_name).strip()
-    parts = raw_name.split(",")
+
+    text = re.sub(r"\s+", " ", str(raw_name)).strip()
+    # Quitar aclaraciones y fechas de nacimiento/fallecimiento.
+    text = re.sub(r"\s*\([^)]*\)", "", text).strip()
+    text = re.sub(r"[,\s]*\b\d{3,4}\s*[-–—]\s*\d{0,4}\b\s*$", "", text).strip(" ,;")
+
+    parts = [part.strip() for part in text.split(",") if part.strip()]
     if len(parts) == 2:
-        return f"{parts[1].strip()} {parts[0].strip()}".strip()
-    return raw_name
+        text = f"{parts[1]} {parts[0]}".strip()
+
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,;")
+    return text or "Desconocido"
+
+
+_LANGUAGE_ALIASES: Dict[str, set] = {
+    "Español": {"es", "esp", "spa", "spanish", "español", "espanol", "castellano", "castilian"},
+    "Inglés": {"en", "eng", "english", "inglés", "ingles"},
+    "Francés": {"fr", "fre", "fra", "french", "francés", "frances"},
+    "Alemán": {"de", "ger", "deu", "german", "alemán", "aleman"},
+    "Italiano": {"it", "ita", "italian", "italiano"},
+    "Portugués": {"pt", "por", "portuguese", "portugués", "portugues"},
+    "Rumano": {"ro", "ron", "rum", "romanian", "rumano"},
+    "Esperanto": {"eo", "epo", "esperanto"},
+    "Húngaro": {"hu", "hun", "hungarian", "húngaro", "hungaro"},
+    "Ruso": {"ru", "rus", "russian", "ruso"},
+    "Japonés": {"ja", "jpn", "japanese", "japonés", "japones"},
+    "Chino": {"zh", "zho", "chi", "chinese", "chino"},
+    "Árabe": {"ar", "ara", "arabic", "árabe", "arabe"},
+    "Latín": {"la", "lat", "latin", "latín"},
+    "Neerlandés": {"nl", "nld", "dut", "dutch", "neerlandés", "neerlandes"},
+    "Catalán": {"ca", "cat", "catalan", "catalán"},
+    "Griego": {"el", "ell", "gre", "greek", "griego"},
+    "Polaco": {"pl", "pol", "polish", "polaco"},
+    "Sueco": {"sv", "swe", "swedish", "sueco"},
+    "Danés": {"da", "dan", "danish", "danés", "danes"},
+    "Finés": {"fi", "fin", "finnish", "finés", "fines"},
+    "Noruego": {"no", "nor", "norwegian", "noruego"},
+    "Checo": {"cs", "ces", "cze", "czech", "checo"},
+    "Hebreo": {"he", "heb", "hebrew", "hebreo"},
+}
+
+
+def _known_language_label(raw_value: Any) -> Optional[str]:
+    """Devuelve la etiqueta canónica solo si el valor parece un idioma conocido."""
+    token = re.split(r"[;,/|()\[\]]", str(raw_value or "").strip().lower())[0].strip()
+    if not token:
+        return None
+    base = token.split("-")[0].strip()
+    for label, codes in _LANGUAGE_ALIASES.items():
+        if token in codes or base in codes:
+            return label
+    return None
+
+
+def normalize_language(raw_language: Any) -> Optional[str]:
+    """Normaliza códigos y nombres de idioma de las distintas fuentes."""
+    if isinstance(raw_language, (list, tuple)):
+        raw_language = raw_language[0] if raw_language else ""
+    if isinstance(raw_language, dict):
+        raw_language = raw_language.get("key") or raw_language.get("name") or ""
+    value = str(raw_language or "").strip()
+    if not value:
+        return None
+
+    known = _known_language_label(value)
+    if known:
+        return known
+    return value.title()[:40]
+
+
+def extract_title_language(raw_title: Any) -> Tuple[str, Optional[str]]:
+    """
+    Separa el idioma cuando el título de la fuente lo incluye entre paréntesis,
+    por ejemplo: 'Don Quijote (Spanish)' -> ('Don Quijote', 'Español').
+
+    Solo se elimina el paréntesis si contiene un idioma reconocido; así no se
+    mutilan títulos como 'El Quijote (Edición ilustrada)'.
+    """
+    title = str(raw_title or "").strip()
+    match = re.search(r"\s*[\(\[]([^\(\)\[\]]+)[\)\]]\s*$", title)
+    if match:
+        language = _known_language_label(match.group(1))
+        if language:
+            cleaned = title[: match.start()].strip(" -–—:,")
+            if cleaned:
+                return cleaned, language
+    return title, None
+
+
+async def _fetch_archive_files(
+    client: httpx.AsyncClient, identifier: str
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """
+    Obtiene las variantes EPUB/PDF de un item de Internet Archive.
+
+    El endpoint /metadata/{id} suele ser lento y limitar peticiones concurrentes.
+    El listado del directorio de descarga es mucho más rápido y ya incluye los
+    nombres y tamaños reales de los archivos.
+    """
+    best: Dict[str, Optional[Dict[str, Any]]] = {"epub": None, "pdf": None}
+
+    def _consider(name: str, size: int, expected_format: str = "") -> None:
+        clean_name = urllib.parse.unquote(str(name or "")).split("?", 1)[0]
+        low = clean_name.lower()
+        if not clean_name or low.startswith("_") or "/" in clean_name:
+            return
+        if low.endswith(("lcp.epub", "_encrypted.epub", "_chocr.html.gz", "_daisy.zip")):
+            return
+
+        fmt = ""
+        if low.endswith(".epub") or expected_format.upper() == "EPUB":
+            fmt = "epub"
+        elif low.endswith(".pdf") or expected_format in ("Text PDF", "Image Container PDF"):
+            fmt = "pdf"
+        if not fmt:
+            return
+
+        if size and (size > MAX_DOWNLOAD_SIZE_BYTES or size < 10000):
+            return
+
+        current = best.get(fmt)
+        if not current or size > int(current.get("size", 0) or 0):
+            best[fmt] = {"name": clean_name, "size": size, "format": fmt}
+
+    # 1. Listado HTML del directorio (rápido y con tamaños).
+    try:
+        from bs4 import BeautifulSoup
+        resp = await client.get(f"https://archive.org/download/{identifier}/", timeout=5.0)
+        if resp.status_code == 200 and "directory-listing-table" in resp.text:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for row in soup.select("table.directory-listing-table tr"):
+                link = row.find("a", href=True)
+                if not link:
+                    continue
+                tds = row.find_all("td")
+                size_text = tds[2].get_text(strip=True) if len(tds) >= 3 else ""
+                _consider(link["href"], parse_libgen_size(size_text))
+            if any(best.values()):
+                return best
+    except Exception as e:
+        logger.debug(f"Listado de Internet Archive falló para {identifier}: {e}")
+
+    # 2. Respaldo: listado JSON de archivos del item.
+    try:
+        resp = await client.get(f"https://archive.org/metadata/{identifier}/files", timeout=3.5)
+        if resp.status_code == 200:
+            for f in resp.json().get("result", []):
+                try:
+                    size = int(f.get("size", 0) or 0)
+                except (ValueError, TypeError):
+                    size = 0
+                _consider(f.get("name", ""), size, f.get("format", ""))
+    except Exception as e:
+        logger.debug(f"Metadatos de archivos fallaron para {identifier}: {e}")
+
+    return best
 
 
 async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -110,115 +388,127 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
 
     params = {
         "q": q_filter,
-        "fl[]": ["identifier", "title", "creator", "year", "format", "downloads"],
+        "fl[]": [
+            "identifier", "title", "creator", "year", "language",
+            "format", "downloads", "collection", "access-restricted-item",
+        ],
         "sort[]": "downloads desc",
         "rows": str(limit + 4),
         "output": "json"
     }
 
     try:
-        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=7.0, verify=False) as client:
             resp = await client.get(ia_search_url, params=params)
             if resp.status_code != 200:
                 return results
 
             data = resp.json()
             docs = data.get("response", {}).get("docs", [])
+            logger.debug(f"Internet Archive devolvió {len(docs)} documentos para '{query}'")
             if not docs:
                 return results
 
+            # Priorizar coincidencias exactas de título antes que popularidad.
+            query_slug = normalize_genre_slug(query)
+            query_tokens = [
+                normalize_genre_slug(token)
+                for token in re.findall(r"\w+", query)
+                if len(token) > 1
+            ]
+            query_tokens = [token for token in query_tokens if token]
+
+            def _relevance(doc: Dict[str, Any]) -> Tuple[int, int]:
+                raw_title = doc.get("title") or ""
+                if isinstance(raw_title, (list, tuple)):
+                    raw_title = raw_title[0] if raw_title else ""
+                title_slug = normalize_genre_slug(str(raw_title))
+                if query_slug and title_slug == query_slug:
+                    rank = 0
+                elif query_slug and query_slug in title_slug:
+                    rank = 1
+                else:
+                    missing = sum(
+                        1 for token in query_tokens if token not in title_slug
+                    )
+                    rank = 2 + missing
+                try:
+                    downloads = int(doc.get("downloads") or 0)
+                except (TypeError, ValueError):
+                    downloads = 0
+                return rank, -downloads
+
+            docs.sort(key=_relevance)
+
             # Inspección concurrente de archivos en paralelo para no bloquear el bot
-            async def _inspect_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            async def _inspect_doc(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
                 identifier = doc.get("identifier")
                 if not identifier:
-                    return None
+                    return []
 
-                title = doc.get("title") or identifier
+                raw_title = doc.get("title") or identifier
+                if isinstance(raw_title, (list, tuple)):
+                    raw_title = raw_title[0] if raw_title else identifier
+                title = str(raw_title).strip() or identifier
                 creator = clean_author_name(doc.get("creator") or "Desconocido")
                 year = str(doc.get("year") or "").strip() or None
+                language = normalize_language(doc.get("language"))
+
+                # Descartar libros de préstamo cerrado / DRM.
+                if str(doc.get("access-restricted-item") or "").lower() in ("true", "1", "yes"):
+                    return []
+                collections = str(doc.get("collection") or "").lower()
+                if "printdisabled" in collections or "inlibrary" in collections:
+                    return []
 
                 try:
-                    meta_url = f"https://archive.org/metadata/{identifier}"
-                    meta_resp = await client.get(meta_url, timeout=3.5)
-                    if meta_resp.status_code != 200:
-                        return None
-
-                    m_json = meta_resp.json()
-                    meta_info = m_json.get("metadata", {})
-                    # Descartar libros de préstamo cerrado / DRM
-                    if (
-                        meta_info.get("access-restricted-item") == "true"
-                        or "printdisabled" in str(meta_info.get("collection", ""))
-                        or "inlibrary" in str(meta_info.get("collection", ""))
-                    ):
-                        return None
-
-                    files_data = m_json.get("files", [])
-                    # Descartar archivos comprimidos masivos o compendios gigantescos
-                    if len(files_data) > 80:
-                        return None
-
-                    epub_file = None
-                    pdf_file = None
-
-                    for f in files_data:
-                        fname = f.get("name", "")
-                        fmt = f.get("format", "")
-                        fname_l = fname.lower()
-                        if (
-                            fname.startswith("_")
-                            or fname_l.endswith((".xml", ".sqlite", ".torrent", "_chocr.html.gz", "_daisy.zip", "lcp.epub", "_encrypted.epub"))
-                        ):
+                    best_files = await _fetch_archive_files(client, identifier)
+                    variants: List[Dict[str, Any]] = []
+                    for fmt_clean in ("epub", "pdf"):
+                        chosen = best_files.get(fmt_clean)
+                        if not chosen:
                             continue
-
-                        try:
-                            fsize = int(f.get("size", 0) or 0)
-                        except (ValueError, TypeError):
-                            fsize = 0
-
-                        if fsize > MAX_DOWNLOAD_SIZE_BYTES or fsize < 10000:
-                            continue
-
-                        if fmt == "EPUB" or fname_l.endswith(".epub"):
-                            if not epub_file or fsize > int(epub_file.get("size", 0) or 0):
-                                epub_file = f
-                        elif fmt in ["Text PDF", "Image Container PDF"] or fname_l.endswith(".pdf"):
-                            if not pdf_file or fsize > int(pdf_file.get("size", 0) or 0):
-                                pdf_file = f
-
-                    chosen = epub_file or pdf_file
-                    if chosen:
                         fname = chosen["name"]
-                        fmt_clean = "epub" if (chosen.get("format") == "EPUB" or fname.lower().endswith(".epub")) else "pdf"
                         size_b = int(chosen.get("size", 0) or 0)
-                        dl_url = f"https://archive.org/download/{identifier}/{urllib.parse.quote(fname, safe='/')}"
-
-                        return {
+                        dl_url = (
+                            f"https://archive.org/download/{identifier}/"
+                            f"{urllib.parse.quote(fname, safe='/')}"
+                        )
+                        variants.append({
                             "source": "Internet Archive",
                             "title": title,
                             "author": creator,
                             "year": year,
+                            "language": language,
                             "format": fmt_clean,
                             "filename": fname,
                             "size_bytes": size_b,
                             "size_str": format_size(size_b) if size_b else "Descarga directa",
                             "download_url": dl_url,
                             "identifier": identifier
-                        }
-                except Exception:
-                    return None
-                return None
+                        })
+                    return variants
+                except Exception as e:
+                    logger.debug(
+                        f"No se pudo inspeccionar el item de Internet Archive "
+                        f"{identifier}: {type(e).__name__}: {e}"
+                    )
+                    return []
 
-            tasks = [_inspect_doc(doc) for doc in docs[:limit + 3]]
+            tasks = [_inspect_doc(doc) for doc in docs[: limit + 4]]
             doc_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in doc_results:
-                if isinstance(r, dict) and r:
-                    results.append(r)
+            for doc_variants in doc_results:
+                if isinstance(doc_variants, list):
+                    for r in doc_variants:
+                        if r:
+                            results.append(r)
+                        if len(results) >= limit:
+                            break
                 if len(results) >= limit:
                     break
 
     except Exception as e:
-        logger.warning(f"Aviso buscando en Archive.org: {e}")
+        logger.warning(f"Aviso buscando en Archive.org ({type(e).__name__}): {e!r}")
 
     return results
 
@@ -234,112 +524,97 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
     params = {"q": raw_terms, "limit": str(limit + 5)}
 
     try:
-        async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
             resp = await client.get(ol_url, params=params)
             if resp.status_code != 200:
                 return results
 
             docs = resp.json().get("docs", [])
 
-            async def _inspect_ol_doc(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            async def _inspect_ol_doc(d: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # Filtrar estrictamente solo libros de acceso público real (no DRM ni préstamo borrowable)
                 ebook_access = d.get("ebook_access")
                 is_public_scan = d.get("public_scan_b", False)
                 if ebook_access != "public" and not is_public_scan:
-                    return None
+                    return []
 
                 ia_ids = d.get("ia", [])
                 if not ia_ids:
-                    return None
+                    return []
 
-                best_ia = None
-                for candidate_id in ia_ids:
-                    if not candidate_id.endswith(("_daisy", "_chocr")):
-                        best_ia = candidate_id
-                        break
-
-                if not best_ia:
-                    return None
+                candidate_ids = [
+                    candidate for candidate in ia_ids
+                    if not candidate.endswith(("_daisy", "_chocr"))
+                ]
+                if not candidate_ids:
+                    candidate_ids = list(ia_ids)
 
                 title = d.get("title") or "Sin título"
                 authors = d.get("author_name", [])
                 author = clean_author_name(authors[0] if authors else "Desconocido")
                 first_pub = str(d.get("first_publish_year") or "").strip() or None
+                language = normalize_language(d.get("language"))
 
                 try:
-                    meta_url = f"https://archive.org/metadata/{best_ia}"
-                    meta_resp = await client.get(meta_url, timeout=3.0)
-                    if meta_resp.status_code != 200:
-                        return None
-
-                    m_json = meta_resp.json()
-                    meta_info = m_json.get("metadata", {})
-                    if (
-                        meta_info.get("access-restricted-item") == "true"
-                        or "printdisabled" in str(meta_info.get("collection", ""))
-                        or "inlibrary" in str(meta_info.get("collection", ""))
-                    ):
-                        return None
-
-                    files_data = m_json.get("files", [])
-                    chosen = None
-                    for f in files_data:
-                        fname = f.get("name", "")
-                        fname_l = fname.lower()
-                        fmt = f.get("format", "")
-                        if fname_l.endswith(".epub") and not fname_l.endswith("lcp.epub"):
-                            chosen = (f, "epub")
+                    best_ia = ""
+                    best_files: Dict[str, Optional[Dict[str, Any]]] = {}
+                    for candidate_id in candidate_ids[:3]:
+                        files = await _fetch_archive_files(client, candidate_id)
+                        if any(files.values()):
+                            best_ia = candidate_id
+                            best_files = files
                             break
-                        elif fmt in ["Text PDF", "Image Container PDF"] or fname_l.endswith(".pdf"):
-                            if not chosen:
-                                chosen = (f, "pdf")
+                    if not best_ia:
+                        return []
 
-                    if chosen:
-                        f_obj, f_fmt = chosen
+                    variants: List[Dict[str, Any]] = []
+                    for f_fmt in ("epub", "pdf"):
+                        f_obj = best_files.get(f_fmt)
+                        if not f_obj:
+                            continue
                         f_size = int(f_obj.get("size", 0) or 0)
-                        if 10000 < f_size <= MAX_DOWNLOAD_SIZE_BYTES:
-                            fname = f_obj["name"]
-                            dl_url = f"https://archive.org/download/{best_ia}/{urllib.parse.quote(fname, safe='/')}"
-                            return {
-                                "source": "Open Library",
-                                "title": title,
-                                "author": author,
-                                "year": first_pub,
-                                "format": f_fmt,
-                                "filename": fname,
-                                "size_bytes": f_size,
-                                "size_str": format_size(f_size),
-                                "download_url": dl_url,
-                                "identifier": f"ol_{best_ia}"
-                            }
+                        fname = f_obj["name"]
+                        dl_url = f"https://archive.org/download/{best_ia}/{urllib.parse.quote(fname, safe='/')}"
+                        variants.append({
+                            "source": "Open Library",
+                            "title": title,
+                            "author": author,
+                            "year": first_pub,
+                            "language": language,
+                            "format": f_fmt,
+                            "filename": fname,
+                            "size_bytes": f_size,
+                            "size_str": format_size(f_size) if f_size else "Descarga directa",
+                            "download_url": dl_url,
+                            "identifier": f"ol_{best_ia}"
+                        })
+                    return variants
                 except Exception:
-                    return None
-                return None
+                    return []
 
-            tasks = [_inspect_ol_doc(d) for d in docs[:limit + 5]]
+            tasks = [_inspect_ol_doc(d) for d in docs[: limit + 6]]
             doc_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in doc_results:
-                if isinstance(r, dict) and r:
-                    results.append(r)
+            for doc_variants in doc_results:
+                if isinstance(doc_variants, list):
+                    for r in doc_variants:
+                        if r:
+                            results.append(r)
+                        if len(results) >= limit:
+                            break
                 if len(results) >= limit:
                     break
 
     except Exception as e:
-        logger.warning(f"Aviso buscando en OpenLibrary: {e}")
+        logger.warning(f"Aviso buscando en OpenLibrary ({type(e).__name__}): {e!r}")
 
     return results
 
 
-async def search_project_gutenberg(query: str, limit: int = 2) -> List[Dict[str, Any]]:
-    """Busca libros libres de dominio público en Project Gutenberg con alta velocidad y descarga garantizada."""
+async def _search_gutenberg_direct(query: str, limit: int) -> List[Dict[str, Any]]:
+    """Busca directamente en la web de Project Gutenberg."""
     results: List[Dict[str, Any]] = []
-    clean_q = re.sub(r"[^\w\s]", " ", query).strip()
-    if not clean_q:
-        return results
-
-    # 1. Búsqueda directa en gutenberg.org (muy rápida y siempre disponible)
     gutenberg_search_url = "https://www.gutenberg.org/ebooks/search/"
-    params = {"query": clean_q, "submit_search": "Go!"}
+    params = {"query": query, "submit_search": "Go!"}
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -347,92 +622,163 @@ async def search_project_gutenberg(query: str, limit: int = 2) -> List[Dict[str,
 
     try:
         from bs4 import BeautifulSoup
-        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True, headers=headers, verify=False) as client:
+        async with httpx.AsyncClient(timeout=4.5, follow_redirects=True, headers=headers, verify=False) as client:
             resp = await client.get(gutenberg_search_url, params=params)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                book_items = soup.select("li.booklink")
-                for item in book_items[:limit]:
-                    a_link = item.select_one("a.link")
-                    if not a_link or not a_link.get("href"):
-                        continue
-                    href = a_link["href"]
-                    m_id = re.search(r"/ebooks/(\d+)", href)
-                    if not m_id:
-                        continue
-                    ebook_id = m_id.group(1)
+            if resp.status_code != 200:
+                return results
 
-                    title_el = item.select_one(".title")
-                    title = title_el.get_text(strip=True) if title_el else "Sin título"
-                    title = re.sub(r"\s*\([A-Za-z]+\)\s*$", "", title).strip()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            book_items = soup.select("li.booklink")
+            for item in book_items[: limit + 3]:
+                a_link = item.select_one("a.link")
+                if not a_link or not a_link.get("href"):
+                    continue
+                href = a_link["href"]
+                m_id = re.search(r"/ebooks/(\d+)", href)
+                if not m_id:
+                    continue
+                ebook_id = m_id.group(1)
 
-                    author_el = item.select_one(".subtitle")
-                    author = clean_author_name(author_el.get_text(strip=True) if author_el else "Desconocido")
+                title_el = item.select_one(".title")
+                raw_title = title_el.get_text(strip=True) if title_el else "Sin título"
+                title, language = extract_title_language(raw_title)
 
-                    clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
-                    dl_url = f"https://www.gutenberg.org/ebooks/{ebook_id}.epub3.images"
+                author_el = item.select_one(".subtitle")
+                author = clean_author_name(author_el.get_text(strip=True) if author_el else "Desconocido")
 
-                    results.append({
-                        "source": "Project Gutenberg",
-                        "title": title,
-                        "author": author,
-                        "year": None,
-                        "format": "epub",
-                        "filename": clean_fname,
-                        "size_bytes": 1024 * 1024,
-                        "size_str": "~1.5 MB",
-                        "download_url": dl_url,
-                        "identifier": f"gutenberg_{ebook_id}"
-                    })
+                clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
+                dl_url = f"https://www.gutenberg.org/ebooks/{ebook_id}.epub3.images"
+
+                results.append({
+                    "source": "Project Gutenberg",
+                    "title": title,
+                    "author": author,
+                    "year": None,
+                    "language": language,
+                    "format": "epub",
+                    "filename": clean_fname,
+                    "size_bytes": 1024 * 1024,
+                    "size_str": "~1.5 MB",
+                    "download_url": dl_url,
+                    "identifier": f"gutenberg_{ebook_id}"
+                })
+                if len(results) >= limit:
+                    break
     except Exception as e:
         logger.debug(f"Aviso buscando directamente en Gutenberg: {e}")
 
-    if results:
-        return results
+    return results
 
-    # 2. Fallback a Gutendex
-    gutendex_url = "https://gutendex.com/books/"
-    params = {"search": clean_q}
 
+async def _search_gutendex(query: str, limit: int) -> List[Dict[str, Any]]:
+    """Consulta Gutendex para obtener idioma y formatos alternativos."""
+    results: List[Dict[str, Any]] = []
     try:
-        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True, verify=False) as client:
-            resp = await client.get(gutendex_url, params=params)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("results", [])
+        async with httpx.AsyncClient(timeout=3.5, follow_redirects=True, verify=False) as client:
+            resp = await client.get("https://gutendex.com/books/", params={"search": query})
+            if resp.status_code != 200:
+                return results
 
-                for item in items[:limit]:
-                    formats = item.get("formats", {})
-                    epub_url = formats.get("application/epub+zip")
-                    if not epub_url:
+            items = resp.json().get("results", [])
+            for item in items[: limit + 3]:
+                formats = item.get("formats", {})
+                epub_url = formats.get("application/epub+zip")
+                pdf_url = formats.get("application/pdf")
+                if not epub_url and not pdf_url:
+                    continue
+
+                authors_raw = item.get("authors", [])
+                author_name = "Desconocido"
+                if authors_raw:
+                    author_name = clean_author_name(authors_raw[0].get("name", "Desconocido"))
+
+                raw_title = re.sub(r"\s+", " ", item.get("title", "Sin título")).strip()
+                title, language = extract_title_language(raw_title)
+                languages = item.get("languages") or []
+                language = normalize_language(languages[0]) if languages else language
+
+                for fmt, dl_url in (("epub", epub_url), ("pdf", pdf_url)):
+                    if not dl_url:
                         continue
-
-                    authors_raw = item.get("authors", [])
-                    author_name = "Desconocido"
-                    if authors_raw:
-                        author_name = clean_author_name(authors_raw[0].get("name", "Desconocido"))
-
-                    title = item.get("title", "Sin título")
-                    title = re.sub(r"\s+", " ", title).strip()
-                    clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
-
+                    clean_fname = (
+                        f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.{fmt}"
+                    )
                     results.append({
                         "source": "Project Gutenberg",
                         "title": title,
                         "author": author_name,
                         "year": None,
-                        "format": "epub",
+                        "language": language,
+                        "format": fmt,
                         "filename": clean_fname,
                         "size_bytes": 1024 * 1024,
                         "size_str": "~1.5 MB",
-                        "download_url": epub_url,
+                        "download_url": dl_url,
                         "identifier": f"gutenberg_{item.get('id')}"
                     })
-
     except Exception as e:
-        logger.debug(f"Aviso buscando en Gutendex fallback: {e}")
+        logger.debug(f"Aviso buscando en Gutendex: {e}")
 
     return results
+
+
+async def search_project_gutenberg(query: str, limit: int = 2) -> List[Dict[str, Any]]:
+    """Busca en Project Gutenberg combinando su web y Gutendex (idioma y formatos)."""
+    clean_q = re.sub(r"[^\w\s]", " ", query).strip()
+    if not clean_q:
+        return []
+
+    direct_result, gutendex_result = await asyncio.gather(
+        _search_gutenberg_direct(clean_q, limit),
+        _search_gutendex(clean_q, limit),
+        return_exceptions=True,
+    )
+    direct = direct_result if isinstance(direct_result, list) else []
+    gutendex = gutendex_result if isinstance(gutendex_result, list) else []
+
+    gutendex_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    for item in gutendex:
+        gid = str(item.get("identifier") or "").replace("gutenberg_", "")
+        gutendex_by_id.setdefault(gid, []).append(item)
+
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for item in direct:
+        identifier = item.get("identifier") or ""
+        gid = identifier.replace("gutenberg_", "")
+        related = gutendex_by_id.get(gid, [])
+
+        if not item.get("language"):
+            item["language"] = next((r.get("language") for r in related if r.get("language")), None)
+
+        fmt = item.get("format") or "epub"
+        seen.add((identifier, fmt))
+        merged.append(item)
+
+        # Gutendex puede ofrecer PDF cuando la web no lo muestra en el resultado.
+        for alt in related:
+            alt_fmt = alt.get("format")
+            if alt_fmt and alt_fmt != fmt and (identifier, alt_fmt) not in seen:
+                alt_copy = dict(alt)
+                alt_copy["title"] = item.get("title") or alt_copy.get("title")
+                alt_copy["author"] = item.get("author") or alt_copy.get("author")
+                alt_copy["year"] = item.get("year") or alt_copy.get("year")
+                seen.add((identifier, alt_fmt))
+                merged.append(alt_copy)
+
+    for item in gutendex:
+        key = (item.get("identifier"), item.get("format"))
+        if key not in seen:
+            seen.add(key)
+            merged.append(item)
+
+    return merged[:limit]
+
+
+def detect_language_from_text(value: str) -> Optional[str]:
+    """Detecta un idioma dentro de una celda de tabla (p. ej. 'English [en]')."""
+    return _known_language_label(value)
 
 
 async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -497,16 +843,26 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
                     author = clean_author_name(tds[1].get_text(strip=True) if len(tds) > 1 else "Desconocido")
 
-                    # Extraer año (columna 4 / índice 3)
+                    # LibGen cambia el orden de columnas entre espejos. Detectamos
+                    # año, idioma y tamaño por su contenido en lugar de por posición.
                     year = None
-                    if len(tds) > 3:
-                        year_raw = tds[3].get_text(strip=True)
-                        if year_raw:
-                            y_match = re.search(r"\b(19\d\d|20\d\d)\b", year_raw)
-                            year = y_match.group(1) if y_match else (year_raw if year_raw.isdigit() else None)
+                    language = None
+                    size_text = ""
+                    for td in tds[3:]:
+                        txt = td.get_text(" ", strip=True)
+                        if not txt:
+                            continue
+                        if not language:
+                            language = detect_language_from_text(txt)
+                        if not year and len(txt) <= 12:
+                            y_match = re.fullmatch(r"(?:c\.?\s*)?((?:19|20)\d{2})", txt, re.IGNORECASE)
+                            if y_match:
+                                year = y_match.group(1)
+                        if not size_text and re.fullmatch(
+                            r"\d+(?:[.,]\d+)?\s*(?:B|kB|KB|MB|GB)", txt, re.IGNORECASE
+                        ):
+                            size_text = txt
 
-                    # Extraer tamaño (columna 7 / índice 6)
-                    size_text = tds[6].get_text(strip=True) if len(tds) > 6 else ""
                     size_bytes = parse_libgen_size(size_text) if size_text else 2 * 1024 * 1024
                     if size_bytes > MAX_DOWNLOAD_SIZE_BYTES:
                         continue
@@ -526,6 +882,7 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                         "title": title,
                         "author": author,
                         "year": year,
+                        "language": language,
                         "format": fmt,
                         "filename": clean_fname,
                         "size_bytes": size_bytes,
@@ -551,13 +908,18 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     return results
 
 
-async def search_external_books(query: str, max_results: int = 5, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+async def search_external_books(query: str, max_results: int = 10, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Busca libros en fuentes concurrentes (Internet Archive, Open Library, Gutenberg y LibGen)
     con límite de tiempo estricto e independiente por fuente para evitar que el bot se quede colgado.
-    Preserva siempre los resultados parciales de las fuentes que respondan a tiempo.
+
+    - Reparte los resultados entre fuentes (round-robin) para que una sola no acapare la lista.
+    - Conserva EPUB y PDF de una misma obra como variantes independientes.
+    - Deduplica por título + autor + formato: así se muestran el mismo título con
+      distintos autores y el mismo autor con distintos libros.
     """
-    effective_limit = limit if limit is not None else max_results
+    effective_limit = max(1, limit if limit is not None else max_results)
+    source_limit = max(3, min(effective_limit, 10))
 
     async def _safe_search(coro, timeout_sec: float) -> List[Dict[str, Any]]:
         try:
@@ -566,26 +928,58 @@ async def search_external_books(query: str, max_results: int = 5, limit: Optiona
             logger.debug(f"Aviso en fuente de búsqueda externa ({timeout_sec}s): {e}")
             return []
 
-    ia_task = _safe_search(search_internet_archive(query, limit=effective_limit), 6.0)
-    ol_task = _safe_search(search_open_library(query, limit=3), 5.0)
-    pg_task = _safe_search(search_project_gutenberg(query, limit=2), 3.0)
-    lg_task = _safe_search(search_libgen(query, limit=effective_limit), 3.0)
+    results_group = await asyncio.gather(
+        _safe_search(search_internet_archive(query, limit=source_limit), 12.5),
+        _safe_search(search_open_library(query, limit=min(source_limit, 5)), 6.5),
+        _safe_search(search_project_gutenberg(query, limit=min(source_limit, 5)), 6.0),
+        _safe_search(search_libgen(query, limit=source_limit), 3.0),
+        return_exceptions=True,
+    )
 
-    results_group = await asyncio.gather(ia_task, ol_task, pg_task, lg_task, return_exceptions=True)
-
-    combined: List[Dict[str, Any]] = []
+    source_order = ["Internet Archive", "Project Gutenberg", "Open Library", "Library Genesis"]
+    grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in source_order}
     for group in results_group:
-        if isinstance(group, list):
-            combined.extend(group)
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            source = item.get("source") or "Otra fuente"
+            grouped.setdefault(source, []).append(item)
+
+    # Round-robin: una variante de cada fuente por vuelta.
+    interleaved: List[Dict[str, Any]] = []
+    max_len = max((len(items) for items in grouped.values()), default=0)
+    for position in range(max_len):
+        for source in source_order:
+            items = grouped.get(source, [])
+            if position < len(items):
+                interleaved.append(items[position])
+        for source, items in grouped.items():
+            if source in source_order:
+                continue
+            if position < len(items):
+                interleaved.append(items[position])
 
     seen_keys = set()
-    unique_results = []
-    for item in combined:
+    seen_urls = set()
+    unique_results: List[Dict[str, Any]] = []
+    for item in interleaved:
         title_slug = normalize_genre_slug(item.get("title") or "")
-        key = f"{title_slug}:{item.get('format', 'epub')}"
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique_results.append(item)
+        author_slug = normalize_genre_slug(item.get("author") or "")
+        fmt = str(item.get("format") or "epub").lower().lstrip(".")
+
+        if title_slug:
+            key = (title_slug, author_slug, fmt)
+        else:
+            key = ("url", item.get("download_url") or "")
+
+        url_key = str(item.get("download_url") or "").split("?", 1)[0]
+        if key in seen_keys or (url_key and url_key in seen_urls):
+            continue
+
+        seen_keys.add(key)
+        if url_key:
+            seen_urls.add(url_key)
+        unique_results.append(item)
         if len(unique_results) >= effective_limit:
             break
 
@@ -654,7 +1048,7 @@ async def download_book_bytes(download_url: str) -> Tuple[bytes, str]:
         if len(content_bytes) > MAX_DOWNLOAD_SIZE_BYTES:
             raise ValueError(f"El archivo pesa {len(content_bytes) / (1024*1024):.1f} MB, excediendo el límite de 48 MB permitido.")
 
-        filename = "libro_descargado.epub"
+        filename = ""
         cd = resp.headers.get("content-disposition", "")
         if "filename=" in cd:
             cd_match = re.search(r'filename=["\']?([^"\';]+)["\']?', cd)
@@ -663,11 +1057,14 @@ async def download_book_bytes(download_url: str) -> Tuple[bytes, str]:
                 if "." in extracted:
                     filename = extracted
 
-        if filename == "libro_descargado.epub" and "/" in target_url:
+        if not filename and "/" in target_url:
             path_part = target_url.split("?")[0].rstrip("/")
             raw_fname = urllib.parse.unquote(path_part.split("/")[-1])
             if raw_fname and "." in raw_fname:
                 filename = raw_fname
+
+        detected_format = detect_book_format(content_bytes, filename)
+        filename = normalize_download_filename(filename, detected_format or "epub")
 
         return content_bytes, filename
 
@@ -689,7 +1086,11 @@ async def ingest_downloaded_book(
     4. Envía el archivo vía Telegram Bot API al Topic.
     5. Guarda el registro en la base de datos.
     """
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "epub"
+    ext = detect_book_format(file_bytes, filename) or (
+        filename.rsplit(".", 1)[-1].lower() if "." in filename else "epub"
+    )
+    filename = normalize_download_filename(filename, ext)
+    original = original_meta or {}
 
     internal_meta = extract_internal_book_metadata(file_bytes, ext)
 
@@ -700,11 +1101,44 @@ async def ingest_downloaded_book(
         internal_metadata=internal_meta
     )
 
-    title = classification.get("title") or (original_meta.get("title") if original_meta else filename)
-    author = classification.get("author") or (original_meta.get("author") if original_meta else "Desconocido")
-    genre = classification.get("genre", "General")
-    suggested_emoji = classification.get("emoji", "📖")
-    pub_year = classification.get("publication_year") or (original_meta.get("year") if original_meta else "Desconocido")
+    # La IA puede devolver "Desconocido" o el nombre numérico del archivo.
+    # En ese caso preferimos el título/autor que ya traía el resultado de búsqueda.
+    classified_title = _clean_meta_value(classification.get("title"))
+    original_title = _clean_meta_value(original.get("title"))
+    if (
+        _looks_like_generic_title(classified_title, ext)
+        and original_title
+        and not _looks_like_generic_title(original_title, ext)
+    ):
+        title = original_title
+    elif not _is_placeholder_metadata(classified_title):
+        title = classified_title
+    elif original_title:
+        title = original_title
+    else:
+        title = filename.rsplit(".", 1)[0] or "Sin título"
+
+    classified_author = _clean_meta_value(classification.get("author"))
+    original_author = _clean_meta_value(original.get("author"))
+    if not _is_placeholder_metadata(classified_author):
+        author = classified_author
+    elif original_author:
+        author = original_author
+    else:
+        author = "Desconocido"
+
+    classified_year = _clean_meta_value(classification.get("publication_year"))
+    original_year = _clean_meta_value(original.get("year"))
+    pub_year = (
+        classified_year if not _is_placeholder_metadata(classified_year)
+        else (original_year or "Desconocido")
+    )
+
+    classified_genre = _clean_meta_value(classification.get("genre"))
+    genre = classified_genre if not _is_placeholder_metadata(classified_genre) else "General"
+    suggested_emoji = classification.get("emoji") or get_genre_emoji(genre)
+    if not isinstance(suggested_emoji, str) or not suggested_emoji.strip():
+        suggested_emoji = get_genre_emoji(genre)
 
     title_slug = normalize_genre_slug(title)
     stmt_books = select(Book).where(Book.telegram_link_id == link.id)
@@ -744,8 +1178,17 @@ async def ingest_downloaded_book(
     previous_book = classification.get("previous_book")
     next_book = classification.get("next_book")
 
+    caption_meta = dict(classification)
+    caption_meta.update({
+        "title": title,
+        "author": author,
+        "genre": genre,
+        "publication_year": pub_year,
+        "emoji": suggested_emoji,
+    })
+
     caption_text = format_book_full_description(
-        book=classification,
+        book=caption_meta,
         chat_books=existing_books,
         clean_chat_id=clean_chat_id,
         current_topic_name=genre,
@@ -754,7 +1197,7 @@ async def ingest_downloaded_book(
     )
 
     clean_file_obj = io.BytesIO(file_bytes)
-    clean_file_obj.name = f"{re.sub(r'[^a-zA-Z0-9_\-. ]', '', title).strip()} - {re.sub(r'[^a-zA-Z0-9_\-. ]', '', author).strip()}.{ext}"
+    clean_file_obj.name = build_book_filename(title, author, ext)
 
     sent_msg = await send_book_document(
         bot=bot,
@@ -774,6 +1217,7 @@ async def ingest_downloaded_book(
         source="download",
         telegram_link_id=link.id,
         telegram_message_id=sent_msg.message_id,
+        telegram_topic_id=topic_id,
         telegram_file_id=getattr(doc_info, "file_id", None),
         file_unique_id=getattr(doc_info, "file_unique_id", None),
         file_format=ext,

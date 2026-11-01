@@ -30,6 +30,7 @@ from app.bot.handlers import (
     search_callback_handler,
     download_command_handler,
     download_callback_handler,
+    download_page_callback_handler,
     topics_list_handler,
     topics_callback_handler,
     topic_index_handler,
@@ -123,6 +124,7 @@ def get_bot_application() -> Application:
         _bot_application.add_handler(CallbackQueryHandler(topic_index_callback_handler, pattern="^tindex:"))
         _bot_application.add_handler(CallbackQueryHandler(topics_callback_handler, pattern="^topics:"))
         _bot_application.add_handler(CallbackQueryHandler(search_callback_handler, pattern="^search:"))
+        _bot_application.add_handler(CallbackQueryHandler(download_page_callback_handler, pattern="^dlp:"))
         _bot_application.add_handler(CallbackQueryHandler(download_callback_handler, pattern="^dl:"))
         _bot_application.add_handler(CallbackQueryHandler(buddy_read_callback_handler, pattern="^br:"))
         _bot_application.add_handler(CallbackQueryHandler(reading_state_callback_handler, pattern="^rs:"))

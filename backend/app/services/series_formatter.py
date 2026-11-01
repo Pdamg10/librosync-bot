@@ -67,16 +67,17 @@ def format_book_full_description(
         previous_book = book.get("previous_book")
         next_book = book.get("next_book")
 
-    title_safe = html.escape(title)
-    author_safe = html.escape(author)
-    genre_safe = html.escape(current_topic_name or genre)
+    title_safe = html.escape(str(title))
+    author_safe = html.escape(str(author))
+    genre_safe = html.escape(str(current_topic_name or genre))
     topic_emo = current_topic_emoji or get_genre_emoji(genre_safe)
+    pub_year_safe = html.escape(str(pub_year))
 
     lines = [
         f"📖 <b>{title_safe}</b>",
         f"✍️ <i>{author_safe}</i>",
         f"🏷️ <b>Tema actual:</b> {topic_emo} <b>{genre_safe}</b>",
-        f"📅 <b>Publicación:</b> <code>{pub_year}</code>"
+        f"📅 <b>Publicación:</b> <code>{pub_year_safe}</code>"
     ]
 
     is_series = bool(series_name or (series_type and series_type.lower() != "autoconclusivo"))

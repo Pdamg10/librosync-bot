@@ -5,6 +5,7 @@ import re
 import html
 import secrets
 import string
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple, Any
 
@@ -1246,7 +1247,260 @@ async def search_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 logger.error(f"Error editando resultados de búsqueda en página {page_num}: {edit_err}")
 
 
-_download_cache: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}  # token -> (books_list, timestamp)
+_DOWNLOAD_CACHE_TTL_SECONDS = 2 * 60 * 60
+_DOWNLOAD_PAGE_SIZE = 5
+_download_cache: Dict[str, Dict[str, Any]] = {}  # token -> {results, created, query}
+_DOWNLOAD_FORMAT_ORDER = {"epub": 0, "pdf": 1, "mobi": 2, "azw3": 3, "cbz": 4, "cbr": 5}
+_DOWNLOAD_FORMAT_ICONS = {
+    "epub": "📗",
+    "pdf": "📄",
+    "mobi": "📘",
+    "azw3": "📘",
+    "cbz": "📦",
+    "cbr": "📦",
+}
+_DOWNLOAD_SOURCE_SHORT = {
+    "Internet Archive": "Archive",
+    "Open Library": "OpenLib",
+    "Project Gutenberg": "Gutenberg",
+    "Library Genesis": "LibGen",
+}
+
+
+def _cleanup_download_cache(now: Optional[float] = None) -> None:
+    """Elimina solicitudes de descarga caducadas para no acumular memoria."""
+    current = time.time() if now is None else now
+    for token in list(_download_cache.keys()):
+        entry = _download_cache.get(token) or {}
+        try:
+            created = float(entry.get("created", 0))
+        except (TypeError, ValueError):
+            created = 0
+        if current - created > _DOWNLOAD_CACHE_TTL_SECONDS:
+            _download_cache.pop(token, None)
+
+
+def _short_display(value: Any, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _format_icon(fmt: str) -> str:
+    return _DOWNLOAD_FORMAT_ICONS.get((fmt or "").lower(), "📥")
+
+
+def _short_source(source: Any) -> str:
+    raw = str(source or "Web").strip()
+    return _DOWNLOAD_SOURCE_SHORT.get(raw, _short_display(raw, 14))
+
+
+_LANGUAGE_FLAGS = {
+    "español": "🇪🇸", "espanol": "🇪🇸",
+    "inglés": "🇬🇧", "ingles": "🇬🇧",
+    "portugués": "🇵🇹", "portugues": "🇵🇹",
+    "italiano": "🇮🇹",
+    "francés": "🇫🇷", "frances": "🇫🇷",
+    "alemán": "🇩🇪", "aleman": "🇩🇪",
+    "rumano": "🇷🇴",
+    "esperanto": "🏳️",
+    "húngaro": "🇭🇺", "hungaro": "🇭🇺",
+    "ruso": "🇷🇺",
+    "japonés": "🇯🇵", "japones": "🇯🇵",
+    "chino": "🇨🇳",
+    "árabe": "🇸🇦", "arabe": "🇸🇦",
+    "latín": "🏛️", "latin": "🏛️",
+    "neerlandés": "🇳🇱", "neerlandes": "🇳🇱",
+    "catalán": "🏴", "catalan": "🏴",
+    "griego": "🇬🇷",
+    "polaco": "🇵🇱",
+    "sueco": "🇸🇪",
+    "danés": "🇩🇰", "danes": "🇩🇰",
+    "finés": "🇫🇮", "fines": "🇫🇮",
+    "noruego": "🇳🇴",
+    "checo": "🇨🇿",
+    "hebreo": "🇮🇱",
+}
+
+
+def _language_flag(language: Any) -> str:
+    value = str(language or "").strip().lower()
+    for name, flag in _LANGUAGE_FLAGS.items():
+        if value.startswith(name):
+            return flag
+    return "🌐"
+
+
+def group_download_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Agrupa variantes de descarga por título + autor normalizados."""
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    ordered: List[Dict[str, Any]] = []
+
+    for idx, item in enumerate(results):
+        title = _short_display(item.get("title") or "Sin título", 160)
+        author = _short_display(item.get("author") or "Desconocido", 120)
+        key = (
+            normalize_genre_slug(title) or title.lower(),
+            normalize_genre_slug(author) or author.lower(),
+        )
+
+        group = grouped.get(key)
+        if group is None:
+            group = {
+                "title": title,
+                "author": author,
+                "language": item.get("language"),
+                "year": item.get("year"),
+                "variants": [],
+            }
+            grouped[key] = group
+            ordered.append(group)
+        else:
+            if not group.get("language") and item.get("language"):
+                group["language"] = item.get("language")
+            if not group.get("year") and item.get("year"):
+                group["year"] = item.get("year")
+
+        group["variants"].append({"index": idx, "item": item})
+
+    for group in ordered:
+        group["variants"].sort(
+            key=lambda variant: (
+                _DOWNLOAD_FORMAT_ORDER.get(
+                    str(variant["item"].get("format") or "").lower(), 9
+                ),
+                _short_source(variant["item"].get("source")),
+            )
+        )
+
+    return ordered
+
+
+def build_download_results_page(
+    query: str,
+    results: List[Dict[str, Any]],
+    token: str,
+    page: int = 1,
+    per_page: int = _DOWNLOAD_PAGE_SIZE,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    """Construye el texto y los botones de una página de resultados de /descargar."""
+    groups = group_download_results(results)
+    total_pages = max(1, (len(groups) + per_page - 1) // per_page)
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 1
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * per_page
+    visible_groups = groups[start: start + per_page]
+
+    lines = [
+        "📥 <b>Libros disponibles para descargar</b>",
+        f"🔎 <i>\"{html.escape(str(query or ''))}\"</i>",
+        (
+            f"📚 <b>{len(groups)}</b> obra(s) · <b>{len(results)}</b> archivo(s) · "
+            f"Página <b>{page}/{total_pages}</b>"
+        ),
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    for offset, group in enumerate(visible_groups):
+        number = start + offset + 1
+        title_safe = html.escape(group["title"])
+        author_safe = html.escape(group["author"])
+
+        meta_parts = []
+        if group.get("year"):
+            meta_parts.append(f"📅 {html.escape(str(group['year']))}")
+
+        lines.append(f"<b>{number}. 📖 {title_safe}</b>")
+        lines.append(f"   ✍️ <i>{author_safe}</i>")
+        if meta_parts:
+            lines.append("   " + " · ".join(meta_parts))
+
+        variant_buttons: List[InlineKeyboardButton] = []
+        seen_variant_indexes = set()
+        for variant in group["variants"]:
+            idx = variant["index"]
+            item = variant["item"]
+            if idx in seen_variant_indexes:
+                continue
+            seen_variant_indexes.add(idx)
+
+            fmt = str(item.get("format") or "epub").lower()
+            icon = _format_icon(fmt)
+            size_safe = html.escape(str(item.get("size_str") or "Directo"))
+            source_safe = html.escape(str(item.get("source") or "Web"))
+            variant_language = item.get("language")
+            language_safe = (
+                f" · {_language_flag(variant_language)} {html.escape(str(variant_language))}"
+                if variant_language else ""
+            )
+
+            lines.append(
+                f"   {icon} <b>{fmt.upper()}</b> · {size_safe} · {source_safe}{language_safe}"
+            )
+            button_language = (
+                f" {_language_flag(variant_language)}" if variant_language else ""
+            )
+            variant_buttons.append(
+                InlineKeyboardButton(
+                    f"{icon} {fmt.upper()} · {_short_source(item.get('source'))}{button_language}",
+                    callback_data=f"dl:{token}:{idx}",
+                )
+            )
+
+        # Máximo dos botones por fila para que se lean bien en móvil.
+        for i in range(0, len(variant_buttons), 2):
+            rows.append(variant_buttons[i: i + 2])
+
+        lines.append("")
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 1:
+            nav_row.append(
+                InlineKeyboardButton("⬅️ Anterior", callback_data=f"dlp:{token}:{page - 1}")
+            )
+        nav_row.append(
+            InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data=f"dlp:{token}:{page}")
+        )
+        if page < total_pages:
+            nav_row.append(
+                InlineKeyboardButton("Siguiente ➡️", callback_data=f"dlp:{token}:{page + 1}")
+            )
+        rows.append(nav_row)
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if total_pages > 1:
+        lines.append(
+            "👇 <i>Elige el formato que deseas descargar. Usa las flechas para ver más resultados.</i>"
+        )
+    else:
+        lines.append(
+            "👇 <i>Elige el formato que deseas descargar y archivar en tu biblioteca.</i>"
+        )
+
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _download_page_for_index(results: List[Dict[str, Any]], idx: int) -> int:
+    """Calcula la página donde aparece una variante dentro de los resultados agrupados."""
+    for group_index, group in enumerate(group_download_results(results)):
+        if any(variant.get("index") == idx for variant in group.get("variants", [])):
+            return group_index // _DOWNLOAD_PAGE_SIZE + 1
+    return 1
+
+
+def _download_back_keyboard(token: str, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Volver a los resultados", callback_data=f"dlp:{token}:{max(1, page)}")]
+    ])
 
 async def download_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1295,19 +1549,17 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
         )
 
     from app.services.book_download_service import search_external_books
-    import time
     import hashlib
 
-    # Limpiar entradas de caché viejas (> 2 horas)
     now = time.time()
-    for k in list(_download_cache.keys()):
-        if now - _download_cache[k][1] > 7200:
-            _download_cache.pop(k, None)
+    _cleanup_download_cache(now)
 
     try:
-        results = await asyncio.wait_for(search_external_books(raw_query, max_results=5), timeout=10.0)
+        results = await asyncio.wait_for(
+            search_external_books(raw_query, max_results=14), timeout=13.0
+        )
     except asyncio.TimeoutError:
-        logger.warning(f"Timeout de 10s en /descargar para '{raw_query}'")
+        logger.warning(f"Timeout de 13s en /descargar para '{raw_query}'")
         results = []
     except Exception as e:
         logger.error(f"Error buscando libros externos: {e}")
@@ -1321,7 +1573,8 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
         no_res = (
             f"❌ <b>No se encontraron libros para:</b> <i>\"{html.escape(raw_query)}\"</i>\n\n"
             "💡 <b>Consejos de búsqueda:</b>\n"
-            "• Intenta con palabras clave o sólo el apellido del autor (ej. <code>/descargar Principito</code> o <code>/descargar García Márquez</code>).\n"
+            "• Busca en español o en inglés, por título o por autor (ej. <code>/descargar El Principito</code> o <code>/descargar Edgar Allan Poe</code>).\n"
+            "• Prueba con menos palabras o sólo el apellido del autor (ej. <code>/descargar García Márquez</code>).\n"
             "• También puedes subir tu propio archivo (PDF o EPUB) directamente al chat y Griffin lo clasificará y archivará automáticamente con IA."
         )
         try:
@@ -1330,37 +1583,20 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
             pass
         return
 
-    token = hashlib.md5(f"{chat.id}:{raw_query}:{time.time()}".encode()).hexdigest()[:8]
-    _download_cache[token] = (results, now)
+    token = hashlib.md5(f"{chat.id}:{raw_query}:{now}".encode()).hexdigest()[:8]
+    _download_cache[token] = {
+        "results": results,
+        "created": now,
+        "query": raw_query,
+    }
 
-    lines = [
-        f"📥 <b>Libros disponibles para descargar:</b>",
-        f"<i>Búsqueda: \"{html.escape(raw_query)}\"</i>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    ]
-
-    buttons = []
-    for idx, b in enumerate(results, start=1):
-        fmt = b["format"].upper()
-        size_str = b.get("size_str") or "Directo"
-        src = b.get("source", "Web")
-        yr_str = f" | 📅 {b['year']}" if b.get("year") else ""
-
-        title_safe = html.escape(b["title"])
-        author_safe = html.escape(b.get("author", "Desconocido"))
-
-        lines.append(
-            f"<b>{idx}. 📖 {title_safe}</b>\n"
-            f"   ✍️ Autor: <i>{author_safe}</i>\n"
-            f"   🏷️ Formato: <code>.{fmt}</code> ({size_str}) | 🏛️ {src}{yr_str}\n"
-        )
-        buttons.append([InlineKeyboardButton(f"📥 Descargar #{idx} (.{fmt})", callback_data=f"dl:{token}:{idx - 1}")])
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("👇 <i>Selecciona qué opción deseas descargar y archivar:</i>")
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await status_msg.edit_text("\n".join(lines), reply_markup=keyboard, parse_mode="HTML")
+    text, keyboard = build_download_results_page(raw_query, results, token, page=1)
+    await status_msg.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 async def download_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1384,14 +1620,20 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     except ValueError:
         return
 
+    _cleanup_download_cache()
     cached_entry = _download_cache.get(token)
     if not cached_entry:
         await query.edit_message_text("⚠️ <i>Esta solicitud de descarga ha expirado. Usa /descargar nuevamente.</i>", parse_mode="HTML")
         return
 
-    results = cached_entry[0]
+    results = cached_entry.get("results") or []
+    page = _download_page_for_index(results, idx) if idx >= 0 else 1
     if idx < 0 or idx >= len(results):
-        await query.edit_message_text("⚠️ Opción no válida.", parse_mode="HTML")
+        await query.edit_message_text(
+            "⚠️ Opción no válida.",
+            parse_mode="HTML",
+            reply_markup=_download_back_keyboard(token, page),
+        )
         return
 
     chosen_book = results[idx]
@@ -1418,7 +1660,8 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
             logger.error(f"Error descargando libro desde {chosen_book['download_url']}: {dl_err}")
             await query.edit_message_text(
                 f"❌ <b>Error al descargar el archivo:</b> {html.escape(str(dl_err)[:200])}",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=_download_back_keyboard(token, page),
             )
             return
 
@@ -1467,7 +1710,8 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
                 logger.error(f"Error ingestando libro descargado: {ing_err}", exc_info=True)
                 await query.edit_message_text(
                     f"❌ <b>Error al archivar el libro:</b> {html.escape(str(ing_err)[:200])}",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=_download_back_keyboard(token, page),
                 )
                 return
 
@@ -1488,7 +1732,8 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
             f"🏷️ Tema: {b_emoji} <b>{b_genre}</b> (<code>.{fmt}</code>)\n\n"
             f"{link_html}",
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=_download_back_keyboard(token, page),
         )
     elif st == "success":
         clean_c_id = str(chat.id).replace("-100", "").replace("-", "")
@@ -1508,9 +1753,60 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
             f"{card_body}\n\n"
             f"{link_html}",
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=_download_back_keyboard(token, page),
         )
 
+
+async def download_page_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Navega entre páginas de resultados de /descargar sin repetir la búsqueda."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or parts[0] != "dlp":
+        return
+
+    token = parts[1]
+    try:
+        page = int(parts[2])
+    except (TypeError, ValueError):
+        return
+
+    _cleanup_download_cache()
+    cached_entry = _download_cache.get(token)
+    if not cached_entry:
+        try:
+            await query.answer("⚠️ Solicitud expirada", show_alert=False)
+        except Exception:
+            pass
+        await query.edit_message_text(
+            "⚠️ <i>Esta búsqueda ha expirado. Usa /descargar nuevamente.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    results = cached_entry.get("results") or []
+    cached_query = cached_entry.get("query") or ""
+
+    text, keyboard = build_download_results_page(
+        cached_query, results, token, page=page
+    )
+    try:
+        await query.answer(f"📄 Página {page}")
+    except Exception:
+        pass
+
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as edit_err:
+        logger.warning(f"No se pudo cambiar la página de descarga: {edit_err}")
 
 
 async def topics_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

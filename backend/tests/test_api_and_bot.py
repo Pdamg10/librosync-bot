@@ -1646,6 +1646,323 @@ async def test_manga_chapter_packages_extraction_and_deduplication(test_session)
     assert meta2["author"] != "170] Solo Leveling"
 
 
+def test_download_format_detection_and_filename_cleanup():
+    """Los enlaces de Gutenberg terminan en .epub3.images y antes se archivaban como formato 'images'."""
+    from app.services.book_download_service import (
+        build_book_filename,
+        detect_book_format,
+        normalize_download_filename,
+    )
+
+    long_name = build_book_filename("Título muy largo " * 30, "Autor " * 30, "epub")
+    assert long_name.endswith(".epub")
+    assert len(long_name) <= 160
+    assert "/" not in long_name and "\\" not in long_name
+
+    assert detect_book_format(b"%PDF-1.7\n...") == "pdf"
+    assert detect_book_format(b"PK\x03\x04fake", "2000.epub3.images") == "epub"
+    assert detect_book_format(b"PK\x03\x04fake", "libro.bin", "epub") == "epub"
+    assert detect_book_format(b"texto plano", "libro.epub") == "epub"
+
+    assert normalize_download_filename("2000.epub3.images", "epub") == "2000.epub"
+    assert normalize_download_filename("2000.epub.images", "epub") == "2000.epub"
+    assert normalize_download_filename("El_Principito.EPUB", "epub") == "El_Principito.EPUB"
+    assert normalize_download_filename("libro_desconocido.bin", "pdf") == "libro_desconocido.pdf"
+    assert normalize_download_filename("libro.epub", "pdf") == "libro.pdf"
+    assert normalize_download_filename("", "epub") == "libro_descargado.epub"
+
+
+@pytest.mark.asyncio
+async def test_ingest_download_uses_search_metadata_when_ai_returns_unknown(test_session, monkeypatch):
+    """Si la IA no reconoce un archivo con nombre técnico, debe conservar título/autor de la búsqueda."""
+    import io
+    import zipfile
+    from app.services import book_download_service as download_service
+
+    user = User(id=105, nombre="Download User")
+    test_session.add(user)
+    await test_session.commit()
+
+    link = TelegramLink(
+        id=105,
+        user_id=105,
+        chat_id=-100105105,
+        chat_type="group_forum",
+        chat_title="Forum Download",
+        bot_is_admin=True,
+        forum_enabled=False
+    )
+    test_session.add(link)
+    await test_session.commit()
+
+    # EPUB mínimo válido (ZIP con mimetype) para que la detección real lo reconozca.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+        zf.writestr("META-INF/container.xml", "<container/>")
+    epub_bytes = buf.getvalue()
+
+    async def mock_classify(**kwargs):
+        return {
+            "title": "Desconocido",
+            "author": "Desconocido",
+            "genre": "General",
+            "publication_year": "Desconocido",
+            "emoji": "📚",
+            "series_name": None,
+            "series_type": "Autoconclusivo",
+            "has_sequel": False,
+        }
+
+    monkeypatch.setattr(download_service, "classify_book_with_gemini", mock_classify)
+    monkeypatch.setattr(download_service, "extract_internal_book_metadata", lambda *a, **k: {})
+
+    sent_kwargs = {}
+
+    async def mock_send_document(**kwargs):
+        sent_kwargs.update(kwargs)
+        sent_msg = MagicMock()
+        sent_msg.message_id = 6100
+        sent_msg.document = MagicMock(file_id="new_file_id", file_unique_id="new_unique_id")
+        return sent_msg
+
+    monkeypatch.setattr(download_service, "send_book_document", mock_send_document)
+
+    result = await download_service.ingest_downloaded_book(
+        bot=MagicMock(),
+        session=test_session,
+        link=link,
+        chat_id=link.chat_id,
+        file_bytes=epub_bytes,
+        filename="2000.epub3.images",
+        original_meta={
+            "title": "Don Quijote de la Mancha",
+            "author": "Miguel de Cervantes",
+            "year": "1605",
+        },
+    )
+
+    assert result["status"] == "success"
+    assert result["title"] == "Don Quijote de la Mancha"
+    assert result["author"] == "Miguel de Cervantes"
+    assert result["publication_year"] == "1605"
+    assert result["file_format"] == "epub"
+    assert sent_kwargs["filename"].endswith(".epub")
+    assert "Desconocido" not in sent_kwargs["filename"]
+    assert "Don Quijote de la Mancha" in sent_kwargs["caption"]
+    assert "Miguel de Cervantes" in sent_kwargs["caption"]
+
+    saved = (await test_session.execute(select(Book).where(Book.id == result["book_id"]))).scalar_one()
+    assert saved.title == "Don Quijote de la Mancha"
+    assert saved.file_format == "epub"
+
+
+def test_download_metadata_helpers_for_language_and_authors():
+    from app.services.book_download_service import (
+        clean_author_name,
+        extract_title_language,
+        normalize_language,
+    )
+
+    assert normalize_language("spa") == "Español"
+    assert normalize_language("esp") == "Español"
+    assert normalize_language("eng") == "Inglés"
+    assert normalize_language("Spanish; Castilian") == "Español"
+    assert normalize_language("en-US") == "Inglés"
+    assert normalize_language("English [en]") == "Inglés"
+    assert normalize_language("Estonian") == "Estonian"
+    assert normalize_language(None) is None
+
+    assert extract_title_language("Don Quijote (Spanish)") == ("Don Quijote", "Español")
+    assert extract_title_language("Hamlet (English)") == ("Hamlet", "Inglés")
+    assert extract_title_language("Cien años de soledad") == ("Cien años de soledad", None)
+    assert extract_title_language("El Quijote (Edición ilustrada)") == (
+        "El Quijote (Edición ilustrada)", None
+    )
+    assert extract_title_language("Cien años de soledad (2020)") == (
+        "Cien años de soledad (2020)", None
+    )
+
+    assert clean_author_name("Cervantes Saavedra, Miguel de") == "Miguel de Cervantes Saavedra"
+    assert clean_author_name(["Shakespeare, William"]) == "William Shakespeare"
+    assert clean_author_name("Fitzgerald, F. Scott (Francis Scott), 1896-1940") == "F. Scott Fitzgerald"
+    assert clean_author_name("García Márquez, Gabriel, 1927-2014") == "Gabriel García Márquez"
+
+
+def test_download_results_group_by_title_author_and_paginate():
+    from app.bot.handlers import build_download_results_page
+
+    def result(title, author, fmt, source="Internet Archive", language="Español", year="2000"):
+        return {
+            "title": title,
+            "author": author,
+            "format": fmt,
+            "source": source,
+            "language": language,
+            "year": year,
+            "size_str": "1.0 MB",
+            "download_url": f"https://example.org/{title}-{author}-{fmt}",
+        }
+
+    results = [
+        result("El Principito", "Antoine de Saint-Exupéry", "epub"),
+        result("El Principito", "Antoine de Saint-Exupéry", "pdf"),
+        result("El Principito", "Otro Autor", "epub", source="Open Library"),
+        result("Cien años de soledad", "Gabriel García Márquez", "epub"),
+        result("Crónica de una muerte anunciada", "Gabriel García Márquez", "epub"),
+        result("El amor en los tiempos del cólera", "Gabriel García Márquez", "epub"),
+        result("Relato de un náufrago", "Gabriel García Márquez", "epub"),
+        result("Los funerales de la Mamá Grande", "Gabriel García Márquez", "epub"),
+    ]
+
+    page1_text, page1_kb = build_download_results_page("García Márquez", results, "tok12345", page=1, per_page=5)
+    assert "El Principito" in page1_text
+    assert "Antoine de Saint-Exupéry" in page1_text
+    assert "Otro Autor" in page1_text
+    assert page1_text.count("El Principito") == 2  # mismo título, autores distintos
+    assert "EPUB" in page1_text and "PDF" in page1_text
+    assert "Español" in page1_text
+    assert "Página <b>1/2</b>" in page1_text
+
+    callbacks = [b.callback_data for row in page1_kb.inline_keyboard for b in row]
+    assert "dl:tok12345:0" in callbacks
+    assert "dl:tok12345:1" in callbacks
+    assert "dl:tok12345:2" in callbacks
+    assert "dlp:tok12345:2" in callbacks
+    assert any("🇪🇸" in b.text for row in page1_kb.inline_keyboard for b in row)
+
+    page2_text, page2_kb = build_download_results_page("García Márquez", results, "tok12345", page=2, per_page=5)
+    assert "Página <b>2/2</b>" in page2_text
+    assert "Relato de un náufrago" in page2_text
+    assert "Los funerales de la Mamá Grande" in page2_text
+    callbacks2 = [b.callback_data for row in page2_kb.inline_keyboard for b in row]
+    assert "dlp:tok12345:1" in callbacks2
+    assert any(cb and cb.startswith("dl:tok12345:") for cb in callbacks2)
+
+
+def test_search_external_books_keeps_authors_and_formats(monkeypatch):
+    from app.services import book_download_service as download_service
+
+    def item(title, author, fmt, source, url, language="Español"):
+        return {
+            "title": title,
+            "author": author,
+            "format": fmt,
+            "source": source,
+            "language": language,
+            "download_url": url,
+        }
+
+    async def fake_ia(query, limit=5):
+        return [
+            item("El Principito", "Antoine de Saint-Exupéry", "epub", "Internet Archive", "https://ia/principito.epub"),
+            item("El Principito", "Antoine de Saint-Exupéry", "pdf", "Internet Archive", "https://ia/principito.pdf"),
+            item("El Principito", "Otro Autor", "epub", "Internet Archive", "https://ia/otro.epub"),
+            item("Cien años de soledad", "Gabriel García Márquez", "epub", "Internet Archive", "https://ia/cien.epub"),
+        ]
+
+    async def fake_ol(query, limit=5):
+        # Duplicado exacto: mismo título + autor + formato que Internet Archive.
+        return [item("El Principito", "Antoine de Saint-Exupéry", "epub", "Open Library", "https://ol/duplicado.epub")]
+
+    async def fake_pg(query, limit=5):
+        # Mismo autor, otro libro: debe conservarse.
+        return [item("Crónica de una muerte anunciada", "Gabriel García Márquez", "epub", "Project Gutenberg", "https://pg/cronica.epub")]
+
+    async def fake_lg(query, limit=5):
+        return []
+
+    monkeypatch.setattr(download_service, "search_internet_archive", fake_ia)
+    monkeypatch.setattr(download_service, "search_open_library", fake_ol)
+    monkeypatch.setattr(download_service, "search_project_gutenberg", fake_pg)
+    monkeypatch.setattr(download_service, "search_libgen", fake_lg)
+
+    import asyncio
+    results = asyncio.run(download_service.search_external_books("García Márquez", max_results=14))
+
+    keys = {(r["title"], r["author"], r["format"]) for r in results}
+    assert ("El Principito", "Antoine de Saint-Exupéry", "epub") in keys
+    assert ("El Principito", "Antoine de Saint-Exupéry", "pdf") in keys
+    assert ("El Principito", "Otro Autor", "epub") in keys
+    assert ("Cien años de soledad", "Gabriel García Márquez", "epub") in keys
+    assert ("Crónica de una muerte anunciada", "Gabriel García Márquez", "epub") in keys
+
+    # El duplicado de Open Library (mismo título/autor/formato) se descarta.
+    assert sum(1 for r in results if r["title"] == "El Principito" and r["author"] == "Antoine de Saint-Exupéry" and r["format"] == "epub") == 1
+    # Se conservan ambos formatos de la misma obra.
+    assert sum(1 for r in results if r["title"] == "El Principito" and r["author"] == "Antoine de Saint-Exupéry") == 2
+
+
+@pytest.mark.asyncio
+async def test_download_pagination_callback_handler():
+    import time
+    from app.bot.handlers import (
+        _download_cache,
+        build_download_results_page,
+        download_page_callback_handler,
+    )
+
+    results = [
+        {
+            "title": f"Libro {i}",
+            "author": "Autor Único",
+            "format": "epub",
+            "source": "Internet Archive",
+            "language": "Español",
+            "download_url": f"https://example.org/{i}.epub",
+        }
+        for i in range(1, 8)
+    ]
+    token = "pagetest"
+    _download_cache[token] = {
+        "results": results,
+        "created": time.time(),
+        "query": "Autor Único",
+    }
+
+    try:
+        mock_query = MagicMock()
+        mock_query.data = f"dlp:{token}:2"
+        mock_query.answer = AsyncMock()
+        mock_query.edit_message_text = AsyncMock()
+
+        mock_update = MagicMock()
+        mock_update.callback_query = mock_query
+
+        await download_page_callback_handler(mock_update, MagicMock())
+
+        assert mock_query.answer.called
+        assert mock_query.edit_message_text.called
+        text = mock_query.edit_message_text.call_args[0][0]
+        assert "Página <b>2/2</b>" in text
+        assert "Libro 6" in text and "Libro 7" in text
+
+        keyboard = mock_query.edit_message_text.call_args[1]["reply_markup"]
+        callbacks = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+        assert f"dlp:{token}:1" in callbacks
+    finally:
+        _download_cache.pop(token, None)
+
+
+@pytest.mark.asyncio
+async def test_download_pagination_expired_token():
+    from app.bot.handlers import download_page_callback_handler
+
+    mock_query = MagicMock()
+    mock_query.data = "dlp:expirado:1"
+    mock_query.answer = AsyncMock()
+    mock_query.edit_message_text = AsyncMock()
+
+    mock_update = MagicMock()
+    mock_update.callback_query = mock_query
+
+    await download_page_callback_handler(mock_update, MagicMock())
+
+    assert mock_query.edit_message_text.called
+    text = mock_query.edit_message_text.call_args[0][0]
+    assert "expirado" in text.lower()
+
+
 
 
 
