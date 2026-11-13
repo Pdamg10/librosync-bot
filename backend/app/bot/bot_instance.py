@@ -1,5 +1,4 @@
 from __future__ import annotations
-import app.core.network_patch
 
 import logging
 from telegram import (

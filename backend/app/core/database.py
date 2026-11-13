@@ -1,18 +1,37 @@
 from typing import AsyncGenerator
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from app.core.config import settings
 
 # In SQLite we need check_same_thread=False
 connect_args = {}
-if settings.DATABASE_URL.startswith("sqlite"):
+is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+if is_sqlite:
     connect_args = {"check_same_thread": False}
 
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    connect_args=connect_args
+    echo=settings.SQL_ECHO,
+    connect_args=connect_args,
+    pool_pre_ping=True,
 )
+
+if is_sqlite:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        """Refuerza integridad y concurrencia de SQLite."""
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON;")
+            cursor.execute("PRAGMA busy_timeout=5000;")
+            # WAL no aplica a bases de datos en memoria usadas por tests.
+            if ":memory:" not in settings.DATABASE_URL:
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+        finally:
+            cursor.close()
+
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -34,32 +53,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db():
     async with engine.begin() as conn:
         # Import models so they are registered with Base.metadata
-        from app.models import user, telegram_link, topic, book, link_code, reading
+        from app.models import user, telegram_link, topic, book, link_code, reading  # noqa: F401
         await conn.run_sync(Base.metadata.create_all)
 
-        def _migrate_columns(sync_conn):
-            from sqlalchemy import inspect, text
-            inspector = inspect(sync_conn)
-            tables = inspector.get_table_names()
-            if "books" in tables:
-                cols = [c["name"] for c in inspector.get_columns("books")]
-                if "publication_year" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN publication_year VARCHAR(50);"))
-                if "series_name" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN series_name VARCHAR(255);"))
-                if "series_type" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN series_type VARCHAR(50);"))
-                if "series_order" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN series_order INTEGER;"))
-                if "series_total" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN series_total INTEGER;"))
-                if "previous_book" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN previous_book VARCHAR(255);"))
-                if "next_book" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN next_book VARCHAR(255);"))
-                if "has_sequel" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN has_sequel BOOLEAN;"))
-                if "telegram_topic_id" not in cols:
-                    sync_conn.execute(text("ALTER TABLE books ADD COLUMN telegram_topic_id INTEGER;"))
-
-        await conn.run_sync(_migrate_columns)
+        from app.core.migrations import run_migrations
+        await conn.run_sync(run_migrations)

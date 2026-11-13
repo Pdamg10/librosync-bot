@@ -1,7 +1,9 @@
+import asyncio
+import io
 import logging
 from typing import Optional, Dict, Any
 from telegram import Bot
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError, BadRequest, RetryAfter
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +73,6 @@ async def send_book_document(
             raise ThreadNotFoundError(f"Thread {topic_id} no existe en Telegram.")
         raise
 
-import asyncio
-from telegram.error import TelegramError, BadRequest, RetryAfter
-
 async def move_or_repost_to_topic(
     bot: Bot,
     chat_id: int,
@@ -125,8 +124,6 @@ async def move_or_repost_to_topic(
             return None
     return None
 
-
-import io
 
 async def get_telegram_file_bytes(bot: Bot, file_id: str) -> tuple[bytes, str]:
     """Descarga los bytes de un archivo desde los servidores de Telegram para servirlo a la app móvil."""

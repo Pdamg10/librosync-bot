@@ -1,8 +1,6 @@
 import html
-import re
 from typing import List, Optional, Dict, Any, Union
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from app.models.book import Book
 from app.services.topic_resolver import normalize_genre_slug

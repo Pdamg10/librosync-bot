@@ -10,7 +10,7 @@ class Topic(Base):
     __tablename__ = "topics"
 
     id = Column(Integer, primary_key=True, index=True)
-    telegram_link_id = Column(Integer, ForeignKey("telegram_links.id", ondelete="CASCADE"), nullable=False)
+    telegram_link_id = Column(Integer, ForeignKey("telegram_links.id", ondelete="CASCADE"), nullable=False, index=True)
     genre = Column(String(100), nullable=False)
     topic_id = Column(Integer, nullable=False)  # message_thread_id from Telegram
     created_at = Column(DateTime, default=utc_now)

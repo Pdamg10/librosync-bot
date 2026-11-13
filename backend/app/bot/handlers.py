@@ -9,39 +9,69 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple, Any
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import (
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
 from sqlalchemy import select, or_
 from sqlalchemy.orm import selectinload
 
 from app.core.database import AsyncSessionLocal
+from app.core.config import settings
+from app.core.rate_limit import (
+    download_limiter,
+    human_retry_after,
+    search_limiter,
+)
+from app.bot.auth import (
+    require_chat_admin,
+    require_group_admin_for_link,
+)
 from app.models.user import User
 from app.models.link_code import LinkCode
 from app.models.telegram_link import TelegramLink
 from app.models.topic import Topic
 from app.models.book import Book
 from app.models.reading import ReadingState, BuddyRead, BuddyReadMember
-from app.services.telegram_service import get_chat_and_bot_status, move_or_repost_to_topic, ThreadNotFoundError
-from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug, delete_topic_by_thread_id
-from app.services.ai_classifier import classify_book_with_gemini, get_genre_emoji
+from app.services.telegram_service import get_chat_and_bot_status
+from app.services.topic_resolver import normalize_genre_slug
+from app.services.ai_classifier import get_genre_emoji
 from app.services.series_formatter import format_book_full_description, enrich_book_series_if_needed
+from app.services.book_processor import (
+    process_book_message,
+    get_chat_lock,
+    clean_filename,
+    SUPPORTED_EXTENSIONS,
+)
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".cbr", ".cbz"}
 
-def clean_filename(filename: str) -> tuple[str, str]:
-    """Separa el nombre base y la extensión limpia"""
-    parts = filename.rsplit(".", 1)
-    if len(parts) == 2:
-        return parts[0], parts[1].lower()
-    return filename, "unknown"
+def _rate_key(update: Update) -> str:
+    user = update.effective_user
+    chat = update.effective_chat
+    return f"user:{user.id}" if user else f"chat:{getattr(chat, 'id', 'unknown')}"
+
+
+def _rate_limit_reply_text(retry_after: float) -> str:
+    return (
+        "⏳ <b>Demasiadas solicitudes.</b>\n"
+        f"Espera {human_retry_after(retry_after)} antes de volver a intentarlo."
+    )
+
+
+async def _get_book_in_chat_scope(
+    session,
+    link: TelegramLink,
+    book_id: int,
+) -> Optional[Book]:
+    """Carga un libro solo si pertenece a la biblioteca del chat actual."""
+    stmt = select(Book).where(Book.id == book_id)
+    if link.chat_type == "private":
+        stmt = stmt.where(
+            or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
+        )
+    else:
+        stmt = stmt.where(Book.telegram_link_id == link.id)
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def _get_or_create_link(bot, session, chat_id: int, effective_user=None) -> Optional[TelegramLink]:
@@ -173,6 +203,16 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Caso 2: /start <codigo>
     code_str = args[0].strip()
+
+    # Solo un administrador del grupo puede vincular la biblioteca del grupo.
+    if chat.type != "private":
+        if not await require_group_admin_for_link(update, context, tg_user.id if tg_user else None):
+            await message.reply_text(
+                "⛔ <b>Permiso denegado.</b>\n"
+                "Solo los administradores de este grupo pueden vincular su biblioteca.",
+                parse_mode="HTML"
+            )
+            return
 
     async with AsyncSessionLocal() as session:
         stmt = select(LinkCode).where(LinkCode.code == code_str)
@@ -326,13 +366,12 @@ async def setup_mode_callback_handler(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data == "setup_mode:back":
-        user_name = html.escape(tg_user.first_name if tg_user else "lector")
         keyboard = [
             [InlineKeyboardButton("👤 Biblioteca Personal", callback_data="setup_mode:personal")],
             [InlineKeyboardButton("👥 Biblioteca de Grupo", callback_data="setup_mode:group")],
         ]
         welcome_text = (
-            f"👋 <b>Soy Griffin, tu bibliotecario digital inteligente.</b>\n\n"
+            "👋 <b>Soy Griffin, tu bibliotecario digital inteligente.</b>\n\n"
             "📚 ¿Cómo deseas utilizarme hoy?\n\n"
             "1️⃣ <b>Biblioteca Personal:</b>\n"
             "Guarda y organiza tus libros directamente en este chat privado.\n\n"
@@ -437,6 +476,9 @@ async def set_topic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("⚠️ Este comando debe ejecutarse <b>dentro</b> del tema que deseas vincular.", parse_mode="HTML")
         return
 
+    if not await require_chat_admin(update, context, "mapear temas"):
+        return
+
     if not context.args:
         await message.reply_text("Uso: <code>/settopic &lt;Nombre del Género&gt;</code> (ejemplo: <code>/settopic Dark Romance</code>)", parse_mode="HTML")
         return
@@ -481,13 +523,6 @@ async def set_topic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-from app.services.book_processor import (
-    process_book_message,
-    get_chat_lock,
-    clean_filename,
-    SUPPORTED_EXTENSIONS
-)
-
 _media_group_batches: Dict[str, dict] = {}
 
 
@@ -500,6 +535,7 @@ async def _process_media_group_batch(mg_id: str, context: ContextTypes.DEFAULT_T
     messages = batch["messages"]
     chat = batch["chat"]
     thread_id = batch["thread_id"]
+    batch_user = batch.get("user")
     total = len(messages)
     import html
 
@@ -517,28 +553,12 @@ async def _process_media_group_batch(mg_id: str, context: ContextTypes.DEFAULT_T
     results = []
     async with get_chat_lock(chat.id):
         async with AsyncSessionLocal() as session:
-            stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
-            res = await session.execute(stmt)
-            link = res.scalar_one_or_none()
-
+            link = await _get_or_create_link(
+                context.bot, session, chat.id, effective_user=batch_user
+            )
             if not link:
-                try:
-                    status_info = await get_chat_and_bot_status(context.bot, chat.id)
-                    chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
-                    link = TelegramLink(
-                        user_id=1,
-                        chat_id=chat.id,
-                        chat_type=chat_type_str,
-                        chat_title=status_info["chat_title"],
-                        bot_is_admin=status_info["bot_is_admin"],
-                        forum_enabled=status_info["forum_enabled"]
-                    )
-                    session.add(link)
-                    await session.commit()
-                    await session.refresh(link)
-                except Exception as autolink_err:
-                    logger.error(f"Error auto-vinculando chat {chat.id}: {autolink_err}")
-                    return
+                logger.info("Lote ignorado: el chat %s no tiene biblioteca vinculada.", chat.id)
+                return
 
             for i, msg in enumerate(messages, start=1):
                 try:
@@ -620,6 +640,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _media_group_batches[mg_id] = {
                 "messages": [],
                 "chat": chat,
+                "user": update.effective_user,
                 "thread_id": getattr(message, "message_thread_id", None),
                 "timer": None
             }
@@ -639,28 +660,12 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Caso B: Libro individual (o mensaje sin media_group_id)
     async with get_chat_lock(chat.id):
         async with AsyncSessionLocal() as session:
-            stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
-            res = await session.execute(stmt)
-            link = res.scalar_one_or_none()
-
+            link = await _get_or_create_link(
+                context.bot, session, chat.id, effective_user=update.effective_user
+            )
             if not link:
-                try:
-                    status_info = await get_chat_and_bot_status(context.bot, chat.id)
-                    chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
-                    link = TelegramLink(
-                        user_id=1,
-                        chat_id=chat.id,
-                        chat_type=chat_type_str,
-                        chat_title=status_info["chat_title"],
-                        bot_is_admin=status_info["bot_is_admin"],
-                        forum_enabled=status_info["forum_enabled"]
-                    )
-                    session.add(link)
-                    await session.commit()
-                    await session.refresh(link)
-                except Exception as autolink_err:
-                    logger.error(f"No se pudo auto-vincular chat {chat.id}: {autolink_err}")
-                    return
+                logger.info("Documento ignorado: el chat %s no tiene biblioteca vinculada.", chat.id)
+                return
 
             res_dict = await process_book_message(
                 bot=context.bot,
@@ -1515,6 +1520,7 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
 
     thread_id = getattr(message, "message_thread_id", None)
     raw_query = " ".join(context.args).strip() if context.args else ""
+    raw_query = re.sub(r"[\x00-\x1f\x7f]", " ", raw_query).strip()[:200]
 
     if not raw_query:
         help_dl = (
@@ -1530,6 +1536,37 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
             await context.bot.send_message(chat_id=chat.id, message_thread_id=thread_id, text=help_dl, parse_mode="HTML")
         except Exception:
             await context.bot.send_message(chat_id=chat.id, text=help_dl, parse_mode="HTML")
+        return
+
+    # Solo se descarga en bibliotecas ya vinculadas (o en el chat privado del dueño).
+    async with AsyncSessionLocal() as session:
+        link = await _get_or_create_link(
+            context.bot, session, chat.id, effective_user=update.effective_user
+        )
+    if not link:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=thread_id,
+            text=(
+                "❌ Este grupo aún no está vinculado a una biblioteca.\n"
+                "Un administrador debe ejecutar <code>/start &lt;código&gt;</code> primero."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    allowed, retry_after = search_limiter.allow(
+        _rate_key(update),
+        settings.SEARCH_RATE_LIMIT,
+        settings.SEARCH_RATE_WINDOW_SECONDS,
+    )
+    if not allowed:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=thread_id,
+            text=_rate_limit_reply_text(retry_after),
+            parse_mode="HTML",
+        )
         return
 
     # Mensaje temporal de búsqueda
@@ -1549,7 +1586,6 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
         )
 
     from app.services.book_download_service import search_external_books
-    import hashlib
 
     now = time.time()
     _cleanup_download_cache(now)
@@ -1583,11 +1619,13 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
             pass
         return
 
-    token = hashlib.md5(f"{chat.id}:{raw_query}:{now}".encode()).hexdigest()[:8]
+    token = secrets.token_urlsafe(8)
     _download_cache[token] = {
         "results": results,
         "created": now,
         "query": raw_query,
+        "chat_id": chat.id,
+        "user_id": update.effective_user.id if update.effective_user else None,
     }
 
     text, keyboard = build_download_results_page(raw_query, results, token, page=1)
@@ -1603,6 +1641,11 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     """Maneja la confirmación de descarga cuando el usuario pulsa un botón."""
     query = update.callback_query
     if not query or not query.data:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat:
         return
 
     try:
@@ -1626,6 +1669,33 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("⚠️ <i>Esta solicitud de descarga ha expirado. Usa /descargar nuevamente.</i>", parse_mode="HTML")
         return
 
+    # La búsqueda solo puede descargarla quien la inició y desde el mismo chat.
+    if (
+        cached_entry.get("chat_id") != chat.id
+        or (cached_entry.get("user_id") is not None and cached_entry.get("user_id") != getattr(user, "id", None))
+    ):
+        try:
+            await query.answer(
+                "⛔ Esta búsqueda pertenece a otro usuario o chat.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
+
+    allowed, retry_after = download_limiter.allow(
+        _rate_key(update),
+        settings.DOWNLOAD_RATE_LIMIT,
+        settings.DOWNLOAD_RATE_WINDOW_SECONDS,
+    )
+    if not allowed:
+        await query.edit_message_text(
+            _rate_limit_reply_text(retry_after),
+            parse_mode="HTML",
+            reply_markup=_download_back_keyboard(token, 1),
+        )
+        return
+
     results = cached_entry.get("results") or []
     page = _download_page_for_index(results, idx) if idx >= 0 else 1
     if idx < 0 or idx >= len(results):
@@ -1644,10 +1714,6 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
         f"<i>Conectando al repositorio público y descargando archivo binario...</i>",
         parse_mode="HTML"
     )
-
-    chat = update.effective_chat
-    if not chat:
-        return
 
     from app.services.book_download_service import download_book_bytes, ingest_downloaded_book
     from app.services.book_processor import get_chat_lock
@@ -1677,24 +1743,17 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
 
         # 3. Ingestar en la biblioteca
         async with AsyncSessionLocal() as session:
-            stmt = select(TelegramLink).where(TelegramLink.chat_id == chat.id)
-            res = await session.execute(stmt)
-            link = res.scalar_one_or_none()
-
+            link = await _get_or_create_link(
+                context.bot, session, chat.id, effective_user=update.effective_user
+            )
             if not link:
-                status_info = await get_chat_and_bot_status(context.bot, chat.id)
-                chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
-                link = TelegramLink(
-                    user_id=1,
-                    chat_id=chat.id,
-                    chat_type=chat_type_str,
-                    chat_title=status_info["chat_title"],
-                    bot_is_admin=status_info["bot_is_admin"],
-                    forum_enabled=status_info["forum_enabled"]
+                await query.edit_message_text(
+                    "❌ Este grupo no está vinculado a una biblioteca. "
+                    "Usa /start con un código de vinculación.",
+                    parse_mode="HTML",
+                    reply_markup=_download_back_keyboard(token, page),
                 )
-                session.add(link)
-                await session.commit()
-                await session.refresh(link)
+                return
 
             try:
                 ingest_res = await ingest_downloaded_book(
@@ -1719,7 +1778,6 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     b_title = html.escape(ingest_res.get("title", chosen_book["title"]))
     b_author = html.escape(ingest_res.get("author", chosen_book.get("author", "Desconocido")))
     b_genre = html.escape(ingest_res.get("genre", "General"))
-    b_year = html.escape(ingest_res.get("publication_year", chosen_book.get("year") or "Desconocido"))
     b_emoji = ingest_res.get("emoji", "📖")
     dest_link = ingest_res.get("dest_link")
     link_html = f'<a href="{dest_link}">👉 Ir al libro en el tema {b_genre}</a>' if dest_link else ""
@@ -1785,6 +1843,16 @@ async def download_page_callback_handler(update: Update, context: ContextTypes.D
             "⚠️ <i>Esta búsqueda ha expirado. Usa /descargar nuevamente.</i>",
             parse_mode="HTML",
         )
+        return
+
+    chat = update.effective_chat
+    if cached_entry.get("chat_id") is not None and (
+        not chat or cached_entry.get("chat_id") != chat.id
+    ):
+        try:
+            await query.answer("⛔ Esta búsqueda pertenece a otro chat.", show_alert=True)
+        except Exception:
+            pass
         return
 
     results = cached_entry.get("results") or []
@@ -2043,8 +2111,6 @@ def build_topic_index_page(
         f"<i>(Página {page} de {total_pages} — {total_books} obras disponibles)</i>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     ]
-
-    clean_chat_id = str(chat_id).replace("-100", "").replace("-", "")
 
     for i, b in enumerate(page_books, start=start_idx + 1):
         fmt = (b.file_format or "pdf").upper()
@@ -2334,6 +2400,9 @@ async def rename_book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not message or not chat:
         return
 
+    if not await require_chat_admin(update, context, "renombrar libros"):
+        return
+
     if not message.reply_to_message:
         await message.reply_text(
             "⚠️ <b>Modo de Uso:</b>\n"
@@ -2446,6 +2515,9 @@ async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat:
         return
 
+    if not await require_chat_admin(update, context, "la sincronización de la biblioteca"):
+        return
+
     thread_id = getattr(message, "message_thread_id", None)
     status_msg = None
     try:
@@ -2520,6 +2592,9 @@ async def deduplicate_command_handler(update: Update, context: ContextTypes.DEFA
     message = update.effective_message
     chat = update.effective_chat
     if not message or not chat:
+        return
+
+    if not await require_chat_admin(update, context, "la deduplicación de la biblioteca"):
         return
 
     thread_id = getattr(message, "message_thread_id", None)
@@ -2605,9 +2680,18 @@ async def lost_book_callback_handler(update: Update, context: ContextTypes.DEFAU
     if not chat:
         return
 
+    if not await require_chat_admin(update, context, "recuperar o descartar libros extraviados"):
+        return
+
     if action == "del":
         async with AsyncSessionLocal() as session:
-            b = (await session.execute(select(Book).where(Book.id == book_id))).scalar_one_or_none()
+            link = (await session.execute(
+                select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+            )).scalar_one_or_none()
+            if not link:
+                await query.answer("Este chat no tiene una biblioteca vinculada.", show_alert=True)
+                return
+            b = await _get_book_in_chat_scope(session, link, book_id)
             if b:
                 title = b.title
                 await session.delete(b)
@@ -2635,7 +2719,16 @@ async def lost_book_callback_handler(update: Update, context: ContextTypes.DEFAU
             pass
 
         async with AsyncSessionLocal() as session:
-            b = (await session.execute(select(Book).where(Book.id == book_id))).scalar_one_or_none()
+            link = (await session.execute(
+                select(TelegramLink).where(TelegramLink.chat_id == chat.id)
+            )).scalar_one_or_none()
+            if not link:
+                await query.edit_message_text(
+                    "⚠️ <i>Este chat no tiene una biblioteca vinculada.</i>",
+                    parse_mode="HTML",
+                )
+                return
+            b = await _get_book_in_chat_scope(session, link, book_id)
             if not b:
                 await query.edit_message_text("⚠️ <i>Este libro ya no figura en el registro de pendientes.</i>", parse_mode="HTML")
                 return
@@ -2681,9 +2774,6 @@ async def lost_book_callback_handler(update: Update, context: ContextTypes.DEFAU
 
             try:
                 file_bytes, filename = await download_book_bytes(best["download_url"])
-                link = (await session.execute(select(TelegramLink).where(TelegramLink.chat_id == chat.id))).scalar_one_or_none()
-                if not link:
-                    link = (await session.execute(select(TelegramLink).where(TelegramLink.id == b.telegram_link_id))).scalar_one_or_none()
 
                 ingest_res = await ingest_downloaded_book(
                     bot=context.bot,
@@ -2737,7 +2827,6 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     thread_id = getattr(message, "message_thread_id", None)
-    clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
 
     async with AsyncSessionLocal() as session:
         link = await _get_or_create_link(context.bot, session, chat.id)
@@ -2956,7 +3045,6 @@ async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAU
             link = res.scalar_one_or_none()
 
             status_info = await get_chat_and_bot_status(context.bot, chat.id)
-            chat_type_str = "group_forum" if status_info["forum_enabled"] else status_info["chat_type"]
 
             if not link:
                 bot_me = await context.bot.get_me()
@@ -3295,7 +3383,6 @@ async def progress_command_handler(update: Update, context: ContextTypes.DEFAULT
     if not message or not chat or not user_tg:
         return
 
-    thread_id = getattr(message, "message_thread_id", None)
     args = context.args
 
     if not args:
@@ -3419,13 +3506,14 @@ async def buddy_read_callback_handler(update: Update, context: ContextTypes.DEFA
 
         if action == "start":
             book_id = int(parts[2])
-            stmt_b = select(Book).options(selectinload(Book.telegram_link)).where(Book.id == book_id)
-            book = (await session.execute(stmt_b)).scalar_one_or_none()
+            link = await _get_or_create_link(
+                context.bot, session, chat.id, effective_user=user_tg
+            )
+            book = await _get_book_in_chat_scope(session, link, book_id) if link else None
             if not book:
-                await query.answer("Libro no encontrado.")
+                await query.answer("Libro no encontrado en esta biblioteca.")
                 return
 
-            link = await _get_or_create_link(context.bot, session, chat.id)
             link_id = link.id if link else None
 
             active_brs = await find_active_buddy_reads_for_book(session, book.id, telegram_link_id=link_id)
@@ -3456,6 +3544,13 @@ async def buddy_read_callback_handler(update: Update, context: ContextTypes.DEFA
             return
 
         br_id = int(parts[2])
+        link = await _get_or_create_link(
+            context.bot, session, chat.id, effective_user=user_tg
+        )
+        if not link:
+            await query.answer("Este chat no tiene una biblioteca vinculada.", show_alert=True)
+            return
+
         stmt_br = (
             select(BuddyRead)
             .options(selectinload(BuddyRead.members), selectinload(BuddyRead.book).selectinload(Book.telegram_link))
@@ -3465,6 +3560,12 @@ async def buddy_read_callback_handler(update: Update, context: ContextTypes.DEFA
         br = res.scalar_one_or_none()
         if not br:
             await query.answer("Lectura conjunta no encontrada.")
+            return
+        if br.telegram_link_id not in (None, link.id):
+            await query.answer("Esta lectura conjunta pertenece a otro chat.", show_alert=True)
+            return
+        if not br.book or not await _get_book_in_chat_scope(session, link, br.book.id):
+            await query.answer("El libro de esta lectura no pertenece a la biblioteca actual.", show_alert=True)
             return
 
         async def _load_br(bid: int):
@@ -3549,9 +3650,13 @@ async def reading_state_callback_handler(update: Update, context: ContextTypes.D
         return
 
     action = parts[1]
-    book_id = int(parts[2])
+    try:
+        book_id = int(parts[2])
+    except (TypeError, ValueError):
+        return
     user_tg = update.effective_user
-    if not user_tg:
+    chat = update.effective_chat
+    if not user_tg or not chat:
         return
 
     from app.services.buddy_read_service import (
@@ -3561,6 +3666,16 @@ async def reading_state_callback_handler(update: Update, context: ContextTypes.D
 
     async with AsyncSessionLocal() as session:
         user_db = await get_or_create_user_from_telegram(session, user_tg)
+        link = await _get_or_create_link(
+            context.bot, session, chat.id, effective_user=user_tg
+        )
+        book = await _get_book_in_chat_scope(session, link, book_id) if link else None
+        if not book:
+            await query.answer(
+                "Libro no encontrado en esta biblioteca.",
+                show_alert=True,
+            )
+            return
 
         if action == "fav":
             stmt = select(ReadingState).where(ReadingState.user_id == user_db.id, ReadingState.book_id == book_id)
@@ -3632,6 +3747,9 @@ async def reorganize_command_handler(update: Update, context: ContextTypes.DEFAU
     message = update.effective_message
     chat = update.effective_chat
     if not message or not chat:
+        return
+
+    if not await require_chat_admin(update, context, "la reorganización de la biblioteca"):
         return
 
     from app.services.book_sync_service import reorganize_misplaced_books

@@ -2,13 +2,12 @@ import html
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, User as TgUser
 
 from app.models.user import User
 from app.models.book import Book
-from app.models.telegram_link import TelegramLink
 from app.models.reading import ReadingState, BuddyRead, BuddyReadMember
 from app.services.ai_classifier import get_genre_emoji
 

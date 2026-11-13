@@ -3,7 +3,7 @@ import logging
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 try:
     import pypdf
 except ImportError:

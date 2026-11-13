@@ -4,14 +4,14 @@ import logging
 from collections import defaultdict
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest
 from app.models.book import Book
 from app.models.topic import Topic
 from app.models.telegram_link import TelegramLink
 from app.models.reading import ReadingState, BuddyRead
-from app.services.topic_resolver import normalize_genre_slug
+from app.services.book_identity import book_identity_key
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +48,15 @@ async def deduplicate_library_for_chat(
 ) -> Dict[str, Any]:
     """
     Escanea la biblioteca de un grupo y elimina libros duplicados de forma autónoma:
-    1. Agrupa los libros por título normalizado y formato.
+    1. Agrupa los libros por título, autor y formato normalizados.
     2. Identifica la versión canónica (priorizando la que tenga mensaje activo en Telegram o género específico).
     3. Para las versiones duplicadas secundarias:
        - Si Griffin tiene permisos de admin y el mensaje existe, elimina el mensaje de Telegram.
        - Reasigna de forma segura cualquier estado de lectura (ReadingState) o lectura conjunta (BuddyRead).
        - Elimina el registro secundario de la base de datos.
+
+    Importante: dos libros con el mismo título y formato pero autores distintos
+    NO son duplicados; se conservan ambos.
     """
     stmt = select(Book).where(Book.telegram_link_id == link_id)
     res = await session.execute(stmt)
@@ -68,9 +71,7 @@ async def deduplicate_library_for_chat(
 
     groups = defaultdict(list)
     for b in all_books:
-        t_slug = normalize_genre_slug(b.title or "")
-        fmt = (b.file_format or "epub").lower()
-        groups[(t_slug, fmt)].append(b)
+        groups[book_identity_key(b.title, b.author, b.file_format)].append(b)
 
     removed_details: List[Dict[str, Any]] = []
 
@@ -245,21 +246,27 @@ async def sync_all_library_for_chat(
     notify_lost: bool = False
 ) -> Dict[str, Any]:
     """
-    Sincronización integral rápida:
+    Sincronización integral:
     1. Deduplica automáticamente copias duplicadas de libros en la BD.
-    2. Cuenta libros activos y estantes sincronizados.
-    3. Devuelve métricas actualizadas sin generar cuellos de botella en la Bot API.
+    2. Purga los libros cuyos mensajes ya no existen en Telegram.
+    3. Cuenta libros activos y estantes sincronizados.
+    4. Devuelve métricas reales de la operación.
     """
-    # 1. Deduplicación en base de datos
+    # 1. Deduplicación en base de datos (título + autor + formato)
     dedup_res = await deduplicate_library_for_chat(bot, session, link_id, chat_id)
     duplicates_removed = dedup_res.get("duplicates_removed", 0)
 
-    # 2. Contar libros activos
+    # 2. Purgar libros eliminados en Telegram
+    purged_books = await purge_deleted_books_for_chat(
+        bot, session, link_id, chat_id, notify_lost=notify_lost
+    )
+
+    # 3. Contar libros activos
     stmt_books = select(Book).where(Book.telegram_link_id == link_id)
     b_res = await session.execute(stmt_books)
     active_books = len(b_res.scalars().all())
 
-    # 3. Contar temas / estantes
+    # 4. Contar temas / estantes
     stmt_topics = select(Topic).where(Topic.telegram_link_id == link_id)
     t_res = await session.execute(stmt_topics)
     topics = t_res.scalars().all()
@@ -269,7 +276,7 @@ async def sync_all_library_for_chat(
 
     return {
         "status": "ok",
-        "purged_books": 0,
+        "purged_books": purged_books,
         "duplicates_removed": duplicates_removed,
         "active_books": active_books,
         "active_topics": active_topics_count,

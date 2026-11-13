@@ -10,7 +10,7 @@ class TelegramLink(Base):
     __tablename__ = "telegram_links"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     chat_id = Column(BigInteger, unique=True, index=True, nullable=False)
     chat_type = Column(String(50), nullable=False)  # group_forum | channel | private
     chat_title = Column(String(255), nullable=True)

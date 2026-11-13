@@ -1,16 +1,12 @@
-import app.core.network_patch
-
 import asyncio
 import logging
 import signal
 from app.core.config import settings
 from app.core.database import init_db
+from app.core.logging_config import configure_logging
 from app.bot.bot_instance import get_bot_application, setup_bot_commands
 
-logging.basicConfig(
-    level=logging.INFO if settings.DEBUG else logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+configure_logging()
 logger = logging.getLogger("librosync")
 
 
@@ -65,6 +61,10 @@ async def keep_alive_task(stop_event: asyncio.Event, target_url: str):
 async def run_bot():
     """Servicio asíncrono puro de Python para el Bot de Telegram Griffin / LibroSync."""
     global _bot_connected
+
+    if settings.ENABLE_NETWORK_PATCH:
+        from app.core.network_patch import apply_network_patches
+        apply_network_patches()
 
     # 0. Iniciar servidor HTTP ligero para health check en la nube
     health_server = None
@@ -177,6 +177,13 @@ async def run_bot():
 
 
 def main():
+    if not settings.TELEGRAM_BOT_TOKEN.strip():
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN no está configurado. Define la variable de entorno "
+            "o crea backend/.env antes de iniciar el bot."
+        )
+    if settings.is_production and settings.SECRET_KEY.startswith("librosync-"):
+        logger.warning("SECRET_KEY insegura en producción; define una clave aleatoria.")
     try:
         asyncio.run(run_bot())
     except (KeyboardInterrupt, SystemExit):

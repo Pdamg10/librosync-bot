@@ -1,16 +1,14 @@
 import logging
 import json
-import asyncio
 import httpx
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.models.book import Book
 from app.models.reading import ReadingState, BuddyRead
-from app.models.telegram_link import TelegramLink
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +22,7 @@ GEMINI_CHAT_MODELS = [
 async def chat_with_griffin_ai(
     session: AsyncSession,
     message: str,
-    user_id: int = 1,
+    user_id: int,
     telegram_link_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """
@@ -39,7 +37,7 @@ async def chat_with_griffin_ai(
     stmt_states = (
         select(ReadingState)
         .options(selectinload(ReadingState.book))
-        .where(or_(ReadingState.user_id == user_id, ReadingState.user_id == 2))
+        .where(ReadingState.user_id == user_id)
     )
     states = (await session.execute(stmt_states)).scalars().all()
 
@@ -73,8 +71,10 @@ async def chat_with_griffin_ai(
         stmt_total = stmt_total.where(Book.telegram_link_id == telegram_link_id)
     total_books_count = (await session.execute(stmt_total)).scalar_one() or len(recent_books)
 
-    # 3. Lecturas conjuntas activas
+    # 3. Lecturas conjuntas activas (solo de la biblioteca actual)
     stmt_br = select(BuddyRead).where(BuddyRead.status == "active").options(selectinload(BuddyRead.book))
+    if telegram_link_id:
+        stmt_br = stmt_br.where(BuddyRead.telegram_link_id == telegram_link_id)
     active_buddy_reads = (await session.execute(stmt_br)).scalars().all()
 
     buddy_context_lines = []
@@ -194,6 +194,8 @@ INSTRUCCIONES PARA TU RESPUESTA:
         clean_ids = [int(x) for x in recommended_ids if str(x).isdigit()]
         if clean_ids:
             stmt_recs = select(Book).where(Book.id.in_(clean_ids))
+            if telegram_link_id:
+                stmt_recs = stmt_recs.where(Book.telegram_link_id == telegram_link_id)
             recommended_books = (await session.execute(stmt_recs)).scalars().all()
 
     return {

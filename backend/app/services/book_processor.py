@@ -1,19 +1,18 @@
 import asyncio
-import html
 import logging
 import re
 from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from telegram import Bot, Message
-from telegram.error import TelegramError, BadRequest
 
 from app.models.book import Book
 from app.models.topic import Topic
 from app.models.telegram_link import TelegramLink
 from app.services.ai_classifier import classify_book_with_gemini, get_genre_emoji
 from app.services.telegram_service import move_or_repost_to_topic, ThreadNotFoundError
-from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug, delete_topic_by_thread_id
+from app.services.topic_resolver import resolve_or_create_topic, delete_topic_by_thread_id
+from app.services.book_identity import book_identity_key
 
 logger = logging.getLogger(__name__)
 
@@ -148,14 +147,17 @@ async def process_book_message(
             if not author or author.lower() in title.lower():
                 author = "Desconocido"
 
-    # 4. Deduplicación Semántica (Título + Formato)
-    title_slug = normalize_genre_slug(title)
+    # 4. Deduplicación Semántica (Título + Autor + Formato)
     stmt_books = select(Book).where(Book.telegram_link_id == link.id)
     b_res = await session.execute(stmt_books)
     all_books = b_res.scalars().all()
 
-    matching_book = next((b for b in all_books if normalize_genre_slug(b.title) == title_slug), None)
-    if matching_book and matching_book.file_format.lower() == ext.lower() and matching_book.telegram_message_id:
+    incoming_key = book_identity_key(title, author, ext)
+    matching_book = next(
+        (b for b in all_books if book_identity_key(b.title, b.author, b.file_format) == incoming_key),
+        None,
+    )
+    if matching_book and matching_book.telegram_message_id:
         if delete_original and link.bot_is_admin:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=message.message_id)

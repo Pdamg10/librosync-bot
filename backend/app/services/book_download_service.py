@@ -1,4 +1,5 @@
 import io
+import ipaddress
 import re
 import logging
 import asyncio
@@ -18,10 +19,23 @@ from app.services.ai_classifier import classify_book_with_gemini, get_genre_emoj
 from app.services.metadata_extractor import extract_internal_book_metadata, is_generic_or_cryptic_filename
 from app.services.telegram_service import send_book_document
 from app.services.series_formatter import format_book_full_description
+from app.services.book_identity import book_identity_key
 
 logger = logging.getLogger(__name__)
 
 MAX_DOWNLOAD_SIZE_BYTES = 48 * 1024 * 1024  # 48 MB (Telegram Bot limit is 50MB)
+MAX_REDIRECTS = 5
+DOWNLOAD_RETRY_ATTEMPTS = 3
+HTTP_HEADERS = {
+    "User-Agent": "LibroSyncBot/1.0 (+https://github.com/Pdamg10/librosync-bot)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+PRIVATE_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "ip6-localhost",
+    "metadata.google.internal",
+}
 
 SUPPORTED_BOOK_FORMATS = {"epub", "pdf", "mobi", "azw3", "cbr", "cbz"}
 _PLACEHOLDER_METADATA = {
@@ -86,6 +100,16 @@ def detect_book_format(
         return expected
 
     return ""
+
+
+def _safe_export_stem(title: str, max_len: int = 40) -> str:
+    """Genera un nombre de archivo seguro sin backslashes en f-strings (Python 3.11)."""
+    return (
+        re.sub(r"[^a-zA-Z0-9_\- ]", "", title or "")[:max_len]
+        .strip()
+        .replace(" ", "_")
+        or "libro"
+    )
 
 
 def normalize_download_filename(filename: str, detected_format: str = "epub") -> str:
@@ -398,7 +422,7 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
     }
 
     try:
-        async with httpx.AsyncClient(timeout=7.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True, headers=HTTP_HEADERS) as client:
             resp = await client.get(ia_search_url, params=params)
             if resp.status_code != 200:
                 return results
@@ -524,7 +548,7 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
     params = {"q": raw_terms, "limit": str(limit + 5)}
 
     try:
-        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, headers=HTTP_HEADERS) as client:
             resp = await client.get(ol_url, params=params)
             if resp.status_code != 200:
                 return results
@@ -622,7 +646,7 @@ async def _search_gutenberg_direct(query: str, limit: int) -> List[Dict[str, Any
 
     try:
         from bs4 import BeautifulSoup
-        async with httpx.AsyncClient(timeout=4.5, follow_redirects=True, headers=headers, verify=False) as client:
+        async with httpx.AsyncClient(timeout=4.5, follow_redirects=True, headers=headers) as client:
             resp = await client.get(gutenberg_search_url, params=params)
             if resp.status_code != 200:
                 return results
@@ -646,7 +670,7 @@ async def _search_gutenberg_direct(query: str, limit: int) -> List[Dict[str, Any
                 author_el = item.select_one(".subtitle")
                 author = clean_author_name(author_el.get_text(strip=True) if author_el else "Desconocido")
 
-                clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.epub"
+                clean_fname = f"{_safe_export_stem(title, 40)}.epub"
                 dl_url = f"https://www.gutenberg.org/ebooks/{ebook_id}.epub3.images"
 
                 results.append({
@@ -674,7 +698,7 @@ async def _search_gutendex(query: str, limit: int) -> List[Dict[str, Any]]:
     """Consulta Gutendex para obtener idioma y formatos alternativos."""
     results: List[Dict[str, Any]] = []
     try:
-        async with httpx.AsyncClient(timeout=3.5, follow_redirects=True, verify=False) as client:
+        async with httpx.AsyncClient(timeout=3.5, follow_redirects=True, headers=HTTP_HEADERS) as client:
             resp = await client.get("https://gutendex.com/books/", params={"search": query})
             if resp.status_code != 200:
                 return results
@@ -700,9 +724,7 @@ async def _search_gutendex(query: str, limit: int) -> List[Dict[str, Any]]:
                 for fmt, dl_url in (("epub", epub_url), ("pdf", pdf_url)):
                     if not dl_url:
                         continue
-                    clean_fname = (
-                        f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:40].strip().replace(' ', '_')}.{fmt}"
-                    )
+                    clean_fname = f"{_safe_export_stem(title, 40)}.{fmt}"
                     results.append({
                         "source": "Project Gutenberg",
                         "title": title,
@@ -801,7 +823,7 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     async def _query_mirror(mirror: str) -> List[Dict[str, Any]]:
         m_results: List[Dict[str, Any]] = []
         try:
-            async with httpx.AsyncClient(timeout=2.5, headers=LIBGEN_HEADERS, follow_redirects=True, verify=False) as client:
+            async with httpx.AsyncClient(timeout=2.5, headers=LIBGEN_HEADERS, follow_redirects=True) as client:
                 resp = await client.get(f"{mirror}/index.php", params=params)
                 if resp.status_code != 200:
                     return m_results
@@ -875,7 +897,7 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                     md5_match = re.search(r"md5=([a-fA-F0-9]{32})", ads_href)
                     md5_id = md5_match.group(1) if md5_match else f"{abs(hash(title))}"
 
-                    clean_fname = f"{re.sub(r'[^a-zA-Z0-9_\- ]', '', title)[:45].strip().replace(' ', '_')}.{fmt}"
+                    clean_fname = f"{_safe_export_stem(title, 45)}.{fmt}"
 
                     m_results.append({
                         "source": "Library Genesis",
@@ -990,18 +1012,149 @@ async def search_external_books(query: str, max_results: int = 10, limit: Option
 search_books_online = search_external_books
 
 
+def _validate_remote_url(url: str) -> str:
+    """Valida esquema y host antes de hacer peticiones salientes."""
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("URL de descarga vacía.")
+
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Solo se permiten URLs HTTP/HTTPS.")
+    if parsed.username or parsed.password:
+        raise ValueError("La URL contiene credenciales embebidas.")
+
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("La URL no contiene un host válido.")
+    if host in PRIVATE_HOSTNAMES or host.endswith((".local", ".internal", ".localhost")):
+        raise ValueError("No se permiten destinos de red internos.")
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return raw
+    if not ip.is_global:
+        raise ValueError("No se permiten direcciones IP privadas o reservadas.")
+    return raw
+
+
+async def _close_response(resp: Any) -> None:
+    close = getattr(resp, "aclose", None)
+    if callable(close):
+        try:
+            await close()
+        except Exception:
+            pass
+
+
+async def _open_response(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+):
+    """Abre una respuesta siguiendo redirecciones de forma segura y manual."""
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        _validate_remote_url(current)
+        if hasattr(client, "build_request") and hasattr(client, "send"):
+            request = client.build_request("GET", current, headers=headers)
+            resp = await client.send(request, stream=True, follow_redirects=False)
+        else:  # pragma: no cover - compatibilidad con clientes de prueba
+            resp = await client.get(current, headers=headers)
+
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status in {301, 302, 303, 307, 308}:
+            location = getattr(resp, "headers", {}).get("location")
+            await _close_response(resp)
+            if not location:
+                raise RuntimeError("Redirección sin cabecera Location.")
+            current = urllib.parse.urljoin(current, location)
+            continue
+        return resp, current
+
+    raise RuntimeError("Demasiadas redirecciones al descargar el archivo.")
+
+
+async def _read_limited(resp: Any, max_bytes: int) -> bytes:
+    """Lee un cuerpo HTTP sin superar el límite, incluso sin Content-Length."""
+    headers = getattr(resp, "headers", {}) or {}
+    raw_length = headers.get("content-length")
+    if raw_length:
+        try:
+            declared = int(raw_length)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > max_bytes:
+            raise ValueError(
+                f"El archivo declarado pesa {declared / (1024 * 1024):.1f} MB, "
+                f"excediendo el límite de {max_bytes / (1024 * 1024):.0f} MB."
+            )
+
+    chunks: List[bytes] = []
+    total = 0
+    aiter = getattr(resp, "aiter_bytes", None)
+    if callable(aiter):
+        async for chunk in aiter():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"El archivo excede el límite de {max_bytes / (1024 * 1024):.0f} MB."
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    # Compatibilidad con respuestas no streaming de tests o servidores.
+    content = getattr(resp, "content", b"") or b""
+    if len(content) > max_bytes:
+        raise ValueError(
+            f"El archivo excede el límite de {max_bytes / (1024 * 1024):.0f} MB."
+        )
+    return content
+
+
+async def _open_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+):
+    last_error: Optional[Exception] = None
+    for attempt in range(DOWNLOAD_RETRY_ATTEMPTS):
+        try:
+            resp, final_url = await _open_response(client, url, headers)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status in {429, 500, 502, 503, 504} and attempt + 1 < DOWNLOAD_RETRY_ATTEMPTS:
+                await _close_response(resp)
+                await asyncio.sleep(0.75 * (attempt + 1))
+                continue
+            return resp, final_url
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = exc
+            if attempt + 1 < DOWNLOAD_RETRY_ATTEMPTS:
+                await asyncio.sleep(0.75 * (attempt + 1))
+                continue
+            raise
+    raise last_error or RuntimeError("No se pudo abrir la descarga.")
+
+
 async def download_book_bytes(download_url: str) -> Tuple[bytes, str]:
     """
     Descarga el archivo binario del libro asegurando que no exceda el límite de Telegram.
     Soporta descarga directa (Archive.org, Gutenberg) y resolución en 2 pasos de LibGen (ads.php -> get.php).
     Devuelve los bytes y el nombre de archivo limpio.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
 
-    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, headers=headers, verify=False) as client:
+    La descarga se hace en streaming, con límite de tamaño, reintentos y sin
+    desactivar la verificación TLS.
+    """
+    headers = dict(HTTP_HEADERS)
+
+    async with httpx.AsyncClient(
+        timeout=45.0,
+        follow_redirects=False,
+        headers=headers,
+    ) as client:
         target_url = download_url
         req_headers = dict(headers)
 
@@ -1009,47 +1162,65 @@ async def download_book_bytes(download_url: str) -> Tuple[bytes, str]:
         if "ads.php" in download_url:
             base_url = download_url.split("/ads.php")[0]
             req_headers["Referer"] = f"{base_url}/index.php"
-            ads_resp = await client.get(download_url, headers=req_headers)
-            if ads_resp.status_code != 200:
-                raise RuntimeError(f"No se pudo acceder a la página de descarga de LibGen ({ads_resp.status_code})")
+            ads_resp, ads_final_url = await _open_with_retries(
+                client, download_url, req_headers
+            )
+            try:
+                ads_status = int(getattr(ads_resp, "status_code", 0) or 0)
+                if ads_status != 200:
+                    raise RuntimeError(
+                        f"No se pudo acceder a la página de descarga de LibGen ({ads_status})"
+                    )
+                ads_bytes = await _read_limited(ads_resp, 2 * 1024 * 1024)
+            finally:
+                await _close_response(ads_resp)
+            ads_text = ads_bytes.decode("utf-8", errors="replace")
 
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(ads_resp.text, "html.parser")
+            soup = BeautifulSoup(ads_text, "html.parser")
             get_link = soup.find("a", string=lambda s: s and s.strip().upper() == "GET")
             get_href = None
             if get_link and get_link.get("href"):
                 get_href = get_link["href"]
             else:
-                m = re.search(r"href=[\"\x27](get\.php\?md5=[^\"\x27]+)[\"\x27]", ads_resp.text)
+                m = re.search(r"href=[\"'](get\.php\?md5=[^\"']+)[\"']", ads_text)
                 if m:
                     get_href = m.group(1)
 
             if not get_href:
                 raise RuntimeError("No se encontró el enlace de descarga directa en LibGen.")
 
-            target_url = urllib.parse.urljoin(download_url, get_href)
-            req_headers["Referer"] = download_url
+            target_url = urllib.parse.urljoin(ads_final_url, get_href)
+            req_headers["Referer"] = ads_final_url
 
-        resp = await client.get(target_url, headers=req_headers)
-        if resp.status_code == 403:
-            raise RuntimeError("El archivo en el repositorio de origen requiere préstamo digital o acceso restringido por derechos de autor. Selecciona otra opción de la lista o sube tu archivo directamente.")
-        if resp.status_code != 200:
-            raise RuntimeError(f"El servidor de origen respondió con código {resp.status_code}")
+        resp, final_url = await _open_with_retries(client, target_url, req_headers)
+        try:
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status == 403:
+                raise RuntimeError(
+                    "El archivo en el repositorio de origen requiere préstamo digital o "
+                    "acceso restringido por derechos de autor. Selecciona otra opción de la lista "
+                    "o sube tu archivo directamente."
+                )
+            if status != 200:
+                raise RuntimeError(f"El servidor de origen respondió con código {status}")
 
-        content_bytes = resp.content
+            content_bytes = await _read_limited(resp, MAX_DOWNLOAD_SIZE_BYTES)
+        finally:
+            await _close_response(resp)
+
         if len(content_bytes) < 20:
             raise ValueError("El archivo descargado está vacío o corrupto.")
 
         # Comprobar que no sea una página HTML de error disfrazada de EPUB/PDF
         first_bytes = content_bytes[:200].lstrip().lower()
         if first_bytes.startswith((b"<!doctype", b"<html", b"<?xml", b"<head")):
-            raise ValueError("El servidor devolvió una página HTML en lugar del archivo binario del libro.")
-
-        if len(content_bytes) > MAX_DOWNLOAD_SIZE_BYTES:
-            raise ValueError(f"El archivo pesa {len(content_bytes) / (1024*1024):.1f} MB, excediendo el límite de 48 MB permitido.")
+            raise ValueError(
+                "El servidor devolvió una página HTML en lugar del archivo binario del libro."
+            )
 
         filename = ""
-        cd = resp.headers.get("content-disposition", "")
+        cd = getattr(resp, "headers", {}).get("content-disposition", "")
         if "filename=" in cd:
             cd_match = re.search(r'filename=["\']?([^"\';]+)["\']?', cd)
             if cd_match:
@@ -1057,14 +1228,17 @@ async def download_book_bytes(download_url: str) -> Tuple[bytes, str]:
                 if "." in extracted:
                     filename = extracted
 
-        if not filename and "/" in target_url:
-            path_part = target_url.split("?")[0].rstrip("/")
+        if not filename and "/" in final_url:
+            path_part = final_url.split("?")[0].rstrip("/")
             raw_fname = urllib.parse.unquote(path_part.split("/")[-1])
             if raw_fname and "." in raw_fname:
                 filename = raw_fname
 
         detected_format = detect_book_format(content_bytes, filename)
         filename = normalize_download_filename(filename, detected_format or "epub")
+        if len(filename) > 180:
+            stem, dot, ext = filename.rpartition(".")
+            filename = f"{stem[:170]}.{ext}" if dot else filename[:180]
 
         return content_bytes, filename
 
@@ -1140,12 +1314,15 @@ async def ingest_downloaded_book(
     if not isinstance(suggested_emoji, str) or not suggested_emoji.strip():
         suggested_emoji = get_genre_emoji(genre)
 
-    title_slug = normalize_genre_slug(title)
     stmt_books = select(Book).where(Book.telegram_link_id == link.id)
     b_res = await session.execute(stmt_books)
     existing_books = b_res.scalars().all()
 
-    matching_book = next((b for b in existing_books if normalize_genre_slug(b.title) == title_slug and b.file_format.lower() == ext), None)
+    incoming_key = book_identity_key(title, author, ext)
+    matching_book = next(
+        (b for b in existing_books if book_identity_key(b.title, b.author, b.file_format) == incoming_key),
+        None,
+    )
     clean_chat_id = str(chat_id).replace("-100", "").replace("-", "")
 
     if matching_book and matching_book.telegram_message_id:

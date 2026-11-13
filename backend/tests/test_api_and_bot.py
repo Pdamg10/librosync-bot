@@ -2,11 +2,14 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from unittest.mock import AsyncMock, MagicMock
 
 from app.core.database import Base, get_db
-from app.main import app
+try:
+    from app.main import app  # compatibilidad con versiones antiguas
+except ImportError:
+    app = None
 from app.models.user import User
 from app.models.telegram_link import TelegramLink
 from app.models.topic import Topic
@@ -241,7 +244,6 @@ def test_fallback_parse_filename():
 
 @pytest.mark.asyncio
 async def test_gemini_retry_on_429():
-    import httpx
     from unittest.mock import patch, AsyncMock
 
     mock_resp_429 = MagicMock()
@@ -265,7 +267,7 @@ async def test_gemini_retry_on_429():
     mock_client.post.side_effect = [mock_resp_429, mock_resp_200]
 
     with patch("httpx.AsyncClient") as mock_client_cls, \
-         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+         patch("asyncio.sleep", new_callable=AsyncMock):
         mock_client_cls.return_value.__aenter__.return_value = mock_client
         res = await classify_book_with_gemini("Cien Años de Soledad.epub")
         assert res["title"] == "Cien Años de Soledad"
@@ -404,7 +406,6 @@ async def test_download_book_file(client, test_session, monkeypatch):
     await test_session.commit()
     await test_session.refresh(book)
 
-    from unittest.mock import AsyncMock
     async def mock_get_bytes(bot, file_id):
         return b"%PDF-1.4 test content", "file.pdf"
 
@@ -418,7 +419,7 @@ async def test_download_book_file(client, test_session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_and_purge_deleted_books(client, test_session, monkeypatch):
-    from app.services.book_sync_service import purge_deleted_books_for_chat, sync_all_library_for_chat
+    from app.services.book_sync_service import purge_deleted_books_for_chat
     from telegram.error import BadRequest
 
     user = User(id=99, nombre="Sync User")
@@ -467,7 +468,6 @@ async def test_sync_and_purge_deleted_books(client, test_session, monkeypatch):
 async def test_multiple_books_batch_processing(test_session, monkeypatch):
     """Verifica que un lote de múltiples libros (ej: 5 libros enviados simultáneamente) se procese y registre por completo."""
     from app.services.book_processor import process_book_message, get_chat_lock
-    from telegram import Document
 
     user = User(id=77, nombre="Batch User")
     test_session.add(user)
@@ -634,11 +634,15 @@ async def test_rename_book_handler_flow(test_session, monkeypatch):
     mock_update = MagicMock()
     mock_update.effective_message = mock_msg
     mock_update.effective_chat = mock_chat
+    mock_update.effective_user = MagicMock(id=88)
 
     mock_context = MagicMock()
     mock_context.args = ["El", "Principito", "-", "Antoine", "de", "Saint-Exupéry", "-", "1943"]
     mock_context.bot = MagicMock()
     mock_context.bot.edit_message_caption = AsyncMock()
+    mock_context.bot.get_chat_member = AsyncMock(
+        return_value=MagicMock(status="administrator")
+    )
 
     await rename_book_handler(mock_update, mock_context)
 
@@ -653,7 +657,7 @@ async def test_rename_book_handler_flow(test_session, monkeypatch):
 @pytest.mark.asyncio
 async def test_search_handler_and_pagination(test_session, monkeypatch):
     """Verifica la búsqueda de libros por título o autor (múltiples libros del mismo autor)."""
-    from app.bot.handlers import search_handler, search_callback_handler
+    from app.bot.handlers import search_handler
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
@@ -774,7 +778,7 @@ async def test_search_handler_and_pagination(test_session, monkeypatch):
 async def test_external_book_search_and_download_flow(test_session, monkeypatch):
     """Verifica el flujo de búsqueda y descarga externa mediante /descargar y su callback."""
     from app.services.book_download_service import format_size, clean_author_name
-    from app.bot.handlers import download_command_handler, download_callback_handler, _download_cache
+    from app.bot.handlers import download_command_handler, download_callback_handler
 
     assert format_size(500 * 1024) == "500.0 KB"
     assert format_size(2 * 1024 * 1024) == "2.0 MB"
@@ -813,6 +817,7 @@ async def test_external_book_search_and_download_flow(test_session, monkeypatch)
     mock_update = MagicMock()
     mock_update.effective_message = mock_msg
     mock_update.effective_chat = mock_chat
+    mock_update.effective_user = MagicMock(id=777)
 
     mock_status_msg = MagicMock()
     mock_status_msg.edit_text = AsyncMock()
@@ -889,6 +894,7 @@ async def test_external_book_search_and_download_flow(test_session, monkeypatch)
     mock_cb_update = MagicMock()
     mock_cb_update.callback_query = mock_query
     mock_cb_update.effective_chat = mock_chat
+    mock_cb_update.effective_user = MagicMock(id=777)
 
     mock_cb_context = MagicMock()
     mock_cb_context.bot = mock_bot
@@ -1248,9 +1254,14 @@ async def test_rename_handler_null_file_ids_no_multiple_results_found(test_sessi
     mock_update = MagicMock()
     mock_update.effective_chat = MagicMock(id=-100702702, type="supergroup")
     mock_update.effective_message = cmd_msg
+    mock_update.effective_user = MagicMock(id=702)
 
     mock_context = MagicMock()
     mock_context.args = ["Dracula", "-", "Bram", "Stoker"]
+    mock_context.bot = MagicMock()
+    mock_context.bot.get_chat_member = AsyncMock(
+        return_value=MagicMock(status="administrator")
+    )
 
     await rename_book_handler(mock_update, mock_context)
 
@@ -1515,10 +1526,9 @@ async def test_buddy_read_and_shelves_bot_handlers(test_session, monkeypatch):
 async def test_deduplication_and_lost_book_sentinel(test_session, monkeypatch):
     from app.services.book_sync_service import (
         deduplicate_library_for_chat,
-        purge_deleted_books_for_chat,
-        sync_all_library_for_chat
+        purge_deleted_books_for_chat
     )
-    from app.bot.handlers import deduplicate_command_handler, lost_book_callback_handler
+    from app.bot.handlers import lost_book_callback_handler
     from app.models.reading import ReadingState
     from telegram.error import BadRequest
 
@@ -1600,9 +1610,15 @@ async def test_deduplication_and_lost_book_sentinel(test_session, monkeypatch):
     mock_query_del.data = "rec:del:803"
     mock_query_del.answer = AsyncMock()
     mock_query_del.edit_message_text = AsyncMock()
-    mock_up_del = MagicMock(callback_query=mock_query_del, effective_chat=MagicMock(id=-100888999))
+    mock_up_del = MagicMock(
+        callback_query=mock_query_del,
+        effective_chat=MagicMock(id=-100888999),
+        effective_user=MagicMock(id=888),
+    )
+    mock_ctx_del = MagicMock(bot=mock_bot)
+    mock_bot.get_chat_member = AsyncMock(return_value=MagicMock(status="administrator"))
 
-    await lost_book_callback_handler(mock_up_del, MagicMock(bot=mock_bot))
+    await lost_book_callback_handler(mock_up_del, mock_ctx_del)
     assert mock_query_del.edit_message_text.called
     assert "descartado" in mock_query_del.edit_message_text.call_args[0][0]
 
@@ -1898,7 +1914,6 @@ async def test_download_pagination_callback_handler():
     import time
     from app.bot.handlers import (
         _download_cache,
-        build_download_results_page,
         download_page_callback_handler,
     )
 
