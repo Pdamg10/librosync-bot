@@ -11,7 +11,7 @@ logger = logging.getLogger("librosync")
 
 
 _bot_connected = False
-SERVICE_VERSION = "2026.11.12-download-timeout"
+SERVICE_VERSION = "2026.11.13-search-and-seed-fix"
 
 
 async def handle_health_check(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):

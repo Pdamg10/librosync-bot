@@ -414,13 +414,19 @@ async def _fetch_archive_files(
 async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Busca libros en Internet Archive con descarga directa en EPUB o PDF en paralelo y de alta velocidad."""
     results: List[Dict[str, Any]] = []
-    boolean_terms, _ = build_search_terms(query)
+    boolean_terms, raw_terms = build_search_terms(query)
     if not boolean_terms:
         return results
 
     ia_search_url = "https://archive.org/advancedsearch.php"
-    # Filtrar explícitamente colecciones con préstamo digital restringido (printdisabled / inlibrary)
-    q_filter = f'mediatype:(texts) AND ({boolean_terms}) AND -collection:(printdisabled) AND -collection:(inlibrary)'
+    terms = [w for w in raw_terms.split() if w]
+    field_clauses = " AND ".join(f"(title:({w}) OR creator:({w}))" for w in terms) if terms else boolean_terms
+    # Filtrar por título/autor y formatos descargables reales, excluyendo colecciones con DRM/préstamo
+    q_filter = (
+        f"mediatype:(texts) AND ({field_clauses}) "
+        f'AND (format:(EPUB) OR format:("Text PDF") OR format:(PDF)) '
+        f"AND -collection:(printdisabled) AND -collection:(inlibrary)"
+    )
 
     params = {
         "q": q_filter,
@@ -836,134 +842,151 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     if not clean_q:
         return results
 
+    _, stripped_q = build_search_terms(clean_q)
+    candidate_queries = [clean_q]
+    if stripped_q and stripped_q.lower() != clean_q.lower():
+        candidate_queries.append(stripped_q)
+
     from bs4 import BeautifulSoup
-    params = {
-        "req": clean_q,
-        "columns[]": ["t", "a"],
-        "objects[]": ["f"],
-        "topics[]": ["l", "f"],
-        "res": "25",
-        "filesuns": "all",
-    }
+
+    def _parse_libgen_rows(html_text: str, mirror: str) -> List[Dict[str, Any]]:
+        m_results: List[Dict[str, Any]] = []
+        if "welcome to nginx" in html_text.lower() or "502 bad gateway" in html_text.lower():
+            return m_results
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        table = soup.find("table", {"id": "tablelibgen"}) or soup.find("table", {"class": "c"})
+        if not table:
+            return m_results
+
+        rows = table.find_all("tr")
+        for row in rows[1:]:
+            tds = row.find_all("td")
+            if len(tds) < 8:
+                continue
+
+            fmt = None
+            for td in tds:
+                txt = td.get_text(strip=True).lower()
+                if txt in ["epub", "pdf"]:
+                    fmt = txt
+                    break
+            if not fmt:
+                continue
+
+            ads_a = row.find(
+                "a",
+                href=lambda h: h and ("ads.php" in h or "get.php" in h or "library.lol" in h),
+            )
+            if not ads_a:
+                continue
+
+            title = ""
+            edition_links = row.find_all("a", href=lambda h: h and "edition.php" in h)
+            if not edition_links:
+                first_a = row.find("a")
+                edition_links = [first_a] if first_a else []
+
+            for cand_a in edition_links:
+                raw_fallback = re.sub(r"\s+", " ", cand_a.get_text(" ", strip=True)).strip()
+                for itag in cand_a.find_all("i"):
+                    itag.decompose()
+                cleaned_t = re.sub(r"\s+", " ", cand_a.get_text(" ", strip=True)).strip()
+                cleaned_t = re.sub(r"\b(?:97[89][\d\-]{10,14}|\d{9}[\dXx])\b[;\s]*", "", cleaned_t).strip(" -;:,")
+                if cleaned_t and not re.fullmatch(r"[\d\s;,\-]+", cleaned_t):
+                    title = cleaned_t
+                    break
+                if raw_fallback and not re.fullmatch(r"[\d\s;,\-]+", raw_fallback) and not title:
+                    title = re.sub(r"\b(?:97[89][\d\-]{10,14}|\d{9}[\dXx])\b[;\s]*", "", raw_fallback).strip(" -;:,")
+
+            if not title:
+                title = "Libro"
+
+            author = clean_author_name(tds[1].get_text(strip=True) if len(tds) > 1 else "Desconocido")
+
+            # LibGen cambia el orden de columnas entre espejos. Detectamos
+            # año, idioma y tamaño por su contenido en lugar de por posición.
+            year = None
+            language = None
+            size_text = ""
+            for td in tds[3:]:
+                txt = td.get_text(" ", strip=True)
+                if not txt:
+                    continue
+                if not language:
+                    language = detect_language_from_text(txt)
+                if not year and len(txt) <= 12:
+                    y_match = re.fullmatch(r"(?:c\.?\s*)?((?:19|20)\d{2})", txt, re.IGNORECASE)
+                    if y_match:
+                        year = y_match.group(1)
+                if not size_text and re.fullmatch(
+                    r"\d+(?:[.,]\d+)?\s*(?:B|kB|KB|MB|GB)", txt, re.IGNORECASE
+                ):
+                    size_text = txt
+
+            size_bytes = parse_libgen_size(size_text) if size_text else 2 * 1024 * 1024
+            if size_bytes > MAX_DOWNLOAD_SIZE_BYTES:
+                continue
+            size_str = size_text or format_size(size_bytes)
+
+            ads_href = ads_a["href"]
+            ads_url = urllib.parse.urljoin(mirror, ads_href)
+
+            md5_match = re.search(r"md5=([a-fA-F0-9]{32})", ads_href)
+            md5_id = md5_match.group(1) if md5_match else f"{abs(hash(title))}"
+
+            clean_fname = f"{_safe_export_stem(title, 45)}.{fmt}"
+
+            m_results.append({
+                "source": "Library Genesis",
+                "title": title,
+                "author": author,
+                "year": year,
+                "language": language,
+                "format": fmt,
+                "filename": clean_fname,
+                "size_bytes": size_bytes,
+                "size_str": size_str,
+                "download_url": ads_url,
+                "identifier": f"libgen_{md5_id}",
+                "is_libgen": True,
+            })
+            if len(m_results) >= limit:
+                break
+        return m_results
 
     async def _query_mirror(mirror: str) -> List[Dict[str, Any]]:
-        m_results: List[Dict[str, Any]] = []
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(6.5, connect=3.0),
+                timeout=httpx.Timeout(5.5, connect=2.5),
                 headers=LIBGEN_HEADERS,
                 follow_redirects=True,
             ) as client:
-                resp = await client.get(f"{mirror}/index.php", params=params)
-                if resp.status_code != 200:
-                    return m_results
-
-                if "welcome to nginx" in resp.text.lower() or "502 bad gateway" in resp.text.lower():
-                    return m_results
-
-                soup = BeautifulSoup(resp.text, "html.parser")
-                table = soup.find("table", {"id": "tablelibgen"}) or soup.find("table", {"class": "c"})
-                if not table:
-                    return m_results
-
-                rows = table.find_all("tr")
-                for row in rows[1:]:
-                    tds = row.find_all("td")
-                    if len(tds) < 8:
+                for q_variant in candidate_queries:
+                    params = {
+                        "req": q_variant,
+                        "columns[]": ["t", "a"],
+                        "objects[]": ["f"],
+                        "topics[]": ["l", "f"],
+                        "res": "25",
+                        "filesuns": "all",
+                    }
+                    resp = await client.get(f"{mirror}/index.php", params=params)
+                    if resp.status_code != 200:
                         continue
-
-                    fmt = None
-                    for td in tds:
-                        txt = td.get_text(strip=True).lower()
-                        if txt in ["epub", "pdf"]:
-                            fmt = txt
-                            break
-                    if not fmt:
-                        continue
-
-                    ads_a = row.find("a", href=lambda h: h and ("ads.php" in h or "get.php" in h or "library.lol" in h))
-                    if not ads_a:
-                        continue
-
-                    title_a = row.find("a", href=lambda h: h and "edition.php" in h) or row.find("a")
-                    if title_a:
-                        for itag in title_a.find_all("i"):
-                            itag.decompose()
-                        title = re.sub(r"\s+", " ", title_a.get_text(strip=True)).strip()
-                    else:
-                        title = "Libro"
-
-                    author = clean_author_name(tds[1].get_text(strip=True) if len(tds) > 1 else "Desconocido")
-
-                    # LibGen cambia el orden de columnas entre espejos. Detectamos
-                    # año, idioma y tamaño por su contenido en lugar de por posición.
-                    year = None
-                    language = None
-                    size_text = ""
-                    for td in tds[3:]:
-                        txt = td.get_text(" ", strip=True)
-                        if not txt:
-                            continue
-                        if not language:
-                            language = detect_language_from_text(txt)
-                        if not year and len(txt) <= 12:
-                            y_match = re.fullmatch(r"(?:c\.?\s*)?((?:19|20)\d{2})", txt, re.IGNORECASE)
-                            if y_match:
-                                year = y_match.group(1)
-                        if not size_text and re.fullmatch(
-                            r"\d+(?:[.,]\d+)?\s*(?:B|kB|KB|MB|GB)", txt, re.IGNORECASE
-                        ):
-                            size_text = txt
-
-                    size_bytes = parse_libgen_size(size_text) if size_text else 2 * 1024 * 1024
-                    if size_bytes > MAX_DOWNLOAD_SIZE_BYTES:
-                        continue
-                    size_str = size_text or format_size(size_bytes)
-
-                    ads_href = ads_a["href"]
-                    ads_url = urllib.parse.urljoin(mirror, ads_href)
-
-                    # Obtener hash MD5
-                    md5_match = re.search(r"md5=([a-fA-F0-9]{32})", ads_href)
-                    md5_id = md5_match.group(1) if md5_match else f"{abs(hash(title))}"
-
-                    clean_fname = f"{_safe_export_stem(title, 45)}.{fmt}"
-
-                    m_results.append({
-                        "source": "Library Genesis",
-                        "title": title,
-                        "author": author,
-                        "year": year,
-                        "language": language,
-                        "format": fmt,
-                        "filename": clean_fname,
-                        "size_bytes": size_bytes,
-                        "size_str": size_str,
-                        "download_url": ads_url,
-                        "identifier": f"libgen_{md5_id}",
-                        "is_libgen": True
-                    })
-                    if len(m_results) >= limit:
-                        break
+                    parsed = _parse_libgen_rows(resp.text, mirror)
+                    if parsed:
+                        return parsed
         except Exception:
             pass
-        return m_results
+        return []
 
-    active_mirrors = ["https://libgen.li", "https://libgen.is"]
-    mirror_tasks = [asyncio.create_task(_query_mirror(m)) for m in active_mirrors]
-    try:
-        for completed in asyncio.as_completed(mirror_tasks):
-            try:
-                r = await completed
-                if isinstance(r, list) and r:
-                    results.extend(r)
-                    break
-            except Exception:
-                continue
-    finally:
-        for t in mirror_tasks:
-            if not t.done():
-                t.cancel()
+    active_mirrors = ["https://libgen.li", "https://libgen.la", "https://libgen.bz"]
+    for mirror in active_mirrors:
+        r = await _query_mirror(mirror)
+        if r:
+            results.extend(r)
+            break
 
     return results
 

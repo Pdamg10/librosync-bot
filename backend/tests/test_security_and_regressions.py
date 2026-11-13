@@ -554,3 +554,84 @@ async def test_download_conversational_followup_and_options_rendering(session, m
     assert any(cb.startswith("dl:") and cb.endswith(":1") for cb in button_callbacks)
 
 
+@pytest.mark.asyncio
+async def test_search_ignores_stopwords_punctuation_and_matches_series_and_owned_groups(session, monkeypatch):
+    from app.bot import handlers
+
+    @asynccontextmanager
+    async def session_ctx():
+        yield session
+
+    monkeypatch.setattr(handlers, "AsyncSessionLocal", session_ctx)
+
+    owner = User(id=10, nombre="Phamela", telegram_user_id=1092373311)
+    group_link = TelegramLink(
+        id=10, user_id=10, chat_id=-1003144905195, chat_type="group_forum",
+        chat_title="Club de lectura", bot_is_admin=True, forum_enabled=True,
+    )
+    priv_link = TelegramLink(
+        id=11, user_id=10, chat_id=1092373311, chat_type="private",
+        chat_title="Biblioteca Personal", bot_is_admin=True, forum_enabled=False,
+    )
+    b1 = Book(
+        user_id=10, telegram_link_id=10, telegram_message_id=201,
+        title="Posdata: te amo", author="Cecelia Ahern", genre="Romance",
+        file_format="epub",
+    )
+    b2 = Book(
+        user_id=10, telegram_link_id=10, telegram_message_id=202,
+        title="Furysong", author="Rosaria Munda", genre="Fantasía",
+        series_name="The Aurelian Cycle", file_format="epub",
+    )
+    session.add_all([owner, group_link, priv_link, b1, b2])
+    await session.commit()
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    update_priv = MagicMock(
+        effective_message=MagicMock(message_thread_id=None, reply_to_message=None),
+        effective_chat=MagicMock(id=1092373311, type="private"),
+        effective_user=MagicMock(id=1092373311, first_name="Phamela"),
+    )
+
+    # 1. Buscar con artículos/stopwords extra y sin dos puntos desde el chat privado de la dueña
+    await handlers.search_handler(update_priv, MagicMock(bot=bot, args=["el", "libro", "de", "Posdata", "te", "amo"]))
+    assert bot.send_message.called
+    assert "Posdata: te amo" in bot.send_message.call_args.kwargs["text"]
+
+    # 2. Buscar por nombre de saga (series_name)
+    bot.send_message.reset_mock()
+    await handlers.search_handler(update_priv, MagicMock(bot=bot, args=["Aurelian", "Cycle"]))
+    assert bot.send_message.called
+    assert "Furysong" in bot.send_message.call_args.kwargs["text"]
+
+
+def test_sqlite_seed_catalog_restores_only_when_empty(tmp_path):
+    import sqlite3
+    from app.core.database import _seed_sqlite_catalog_if_empty
+
+    seed_db = tmp_path / "seed.db"
+    target_db = tmp_path / "target.db"
+
+    with sqlite3.connect(str(seed_db)) as conn:
+        conn.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)")
+        conn.execute("INSERT INTO books (id, title) VALUES (1, 'El Principito')")
+        conn.commit()
+
+    # 1. Target inexistente -> se restaura desde semilla
+    assert _seed_sqlite_catalog_if_empty(str(target_db), str(seed_db)) is True
+    with sqlite3.connect(str(target_db)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+        assert count == 1
+
+    # 2. Target ya poblado -> NO se sobrescribe
+    with sqlite3.connect(str(target_db)) as conn:
+        conn.execute("INSERT INTO books (id, title) VALUES (2, 'Nuevo Libro')")
+        conn.commit()
+    assert _seed_sqlite_catalog_if_empty(str(target_db), str(seed_db)) is False
+    with sqlite3.connect(str(target_db)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+        assert count == 2
+
+
+

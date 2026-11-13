@@ -17,6 +17,7 @@ backend/storage
 storage
 *.db
 **/*.db
+!librosync.db
 *.db-journal
 *.db-wal
 *.db-shm

@@ -50,7 +50,13 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
     # Database
-    DATABASE_URL: str = f"sqlite+aiosqlite:///{BASE_DIR}/librosync.db"
+    DATABASE_URL: str = Field(
+        default_factory=lambda: (
+            f"sqlite+aiosqlite:///{BASE_DIR.parent}/librosync.db"
+            if (BASE_DIR.parent / "librosync.db").exists()
+            else f"sqlite+aiosqlite:///{BASE_DIR}/librosync.db"
+        )
+    )
     SQL_ECHO: bool = False
 
     # API

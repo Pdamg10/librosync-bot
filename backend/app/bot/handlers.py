@@ -61,7 +61,12 @@ def _rate_limit_reply_text(retry_after: float) -> str:
 def _book_scope_filter(link: TelegramLink):
     """Filtro de alcance de libros según el tipo de chat (privado vs grupo)."""
     if link.chat_type == "private":
-        return or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
+        owned_links = select(TelegramLink.id).where(TelegramLink.user_id == link.user_id)
+        return or_(
+            Book.telegram_link_id == link.id,
+            Book.user_id == link.user_id,
+            Book.telegram_link_id.in_(owned_links),
+        )
     return Book.telegram_link_id == link.id
 
 
@@ -1039,12 +1044,76 @@ async def catalog_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
 _search_query_cache: Dict[str, Tuple[str, float]] = {}  # token -> (query_text, timestamp)
 
+_SEARCH_STOP_WORDS = {
+    "el", "la", "los", "las", "un", "una", "unos", "unas",
+    "de", "del", "a", "al", "en", "y", "e", "o", "u",
+    "por", "para", "con", "sin", "sobre", "que", "se", "su", "sus",
+    "libro", "libros", "saga", "serie", "tomo", "parte", "vol", "volumen",
+    "the", "of", "and", "in", "to",
+}
+
+
 def _normalize_search_string(text: str) -> str:
     import unicodedata
     if not text:
         return ""
-    nfkd = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8")
-    return nfkd.lower().strip()
+    nfkd = unicodedata.normalize("NFKD", str(text)).encode("ASCII", "ignore").decode("utf-8")
+    cleaned = re.sub(r"[^\w\s]", " ", nfkd.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _filter_books_by_query(all_books: List[Book], raw_query: str) -> List[Book]:
+    """
+    Filtra y ordena libros por relevancia buscando en título, autor, saga y género.
+    Ignora signos de puntuación, tildes y artículos vacíos (stop words), y ofrece
+    coincidencia parcial cuando el usuario incluye subtítulos o palabras adicionales.
+    """
+    norm_q = _normalize_search_string(raw_query)
+    if not norm_q:
+        return []
+
+    all_tokens = [t for t in norm_q.split() if t]
+    core_tokens = [
+        t for t in all_tokens if t not in _SEARCH_STOP_WORDS and len(t) > 1
+    ] or all_tokens
+
+    exact_matches: List[Tuple[int, str, Book]] = []
+    partial_matches: List[Tuple[int, str, Book]] = []
+
+    for b in all_books:
+        title_norm = _normalize_search_string(b.title)
+        author_norm = _normalize_search_string(b.author or "")
+        series_norm = _normalize_search_string(getattr(b, "series_name", "") or "")
+        genre_norm = _normalize_search_string(b.genre or "")
+        searchable = f"{title_norm} {author_norm} {series_norm} {genre_norm}".strip()
+
+        if not searchable:
+            continue
+
+        sort_title = title_norm or ""
+
+        if norm_q in title_norm or norm_q in author_norm or (series_norm and norm_q in series_norm):
+            exact_matches.append((0, sort_title, b))
+        elif all(t in searchable for t in all_tokens):
+            exact_matches.append((1, sort_title, b))
+        elif all(t in searchable for t in core_tokens):
+            exact_matches.append((2, sort_title, b))
+        elif len(core_tokens) >= 2:
+            primary_text = f"{title_norm} {author_norm} {series_norm}"
+            sig_hits = [t for t in core_tokens if len(t) >= 3 and t in primary_text]
+            min_required = max(1, len(core_tokens) - 1)
+            if len(sig_hits) >= min_required:
+                partial_matches.append((-len(sig_hits), sort_title, b))
+
+    if exact_matches:
+        exact_matches.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in exact_matches]
+
+    if partial_matches:
+        partial_matches.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in partial_matches]
+
+    return []
 
 def build_search_results_page(
     chat_id: int,
@@ -1167,7 +1236,9 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _search_query_cache[token] = (raw_query, now)
 
     async with AsyncSessionLocal() as session:
-        link = await _get_or_create_link(context.bot, session, chat.id)
+        link = await _get_or_create_link(
+            context.bot, session, chat.id, effective_user=update.effective_user
+        )
         if not link:
             await context.bot.send_message(
                 chat_id=chat.id,
@@ -1177,7 +1248,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Consultar libros (en privado consulta los del usuario, en grupo los del grupo)
+        # Consultar libros (en privado consulta los del usuario y sus grupos vinculados, en grupo los del grupo)
         stmt_books = (
             select(Book)
             .options(selectinload(Book.telegram_link))
@@ -1187,13 +1258,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b_res = await session.execute(stmt_books)
         all_books = b_res.scalars().all()
 
-        # Filtrar por tokens normalizados
-        q_tokens = [_normalize_search_string(t) for t in raw_query.split() if t.strip()]
-        matches = []
-        for b in all_books:
-            searchable = f"{_normalize_search_string(b.title)} {_normalize_search_string(b.author or '')} {_normalize_search_string(b.genre or '')}"
-            if all(t in searchable for t in q_tokens):
-                matches.append(b)
+        matches = _filter_books_by_query(all_books, raw_query)
 
         if not matches:
             q_safe = html.escape(raw_query)
@@ -1275,7 +1340,9 @@ async def search_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         raw_query = cached_entry[0]
 
         async with AsyncSessionLocal() as session:
-            link = await _get_or_create_link(context.bot, session, chat.id)
+            link = await _get_or_create_link(
+                context.bot, session, chat.id, effective_user=update.effective_user
+            )
             if not link:
                 return
 
@@ -1288,11 +1355,7 @@ async def search_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             b_res = await session.execute(stmt_books)
             all_books = b_res.scalars().all()
 
-            q_tokens = [_normalize_search_string(t) for t in raw_query.split() if t.strip()]
-            matches = [
-                b for b in all_books
-                if all(t in f"{_normalize_search_string(b.title)} {_normalize_search_string(b.author or '')} {_normalize_search_string(b.genre or '')}" for t in q_tokens)
-            ]
+            matches = _filter_books_by_query(all_books, raw_query)
 
             text, keyboard = build_search_results_page(chat.id, raw_query, token, matches, page=page_num)
             try:
@@ -3139,12 +3202,9 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             _clear_pending_command_prompt(update)
 
-            q_tokens = [_normalize_search_string(t) for t in query_text.split() if t.strip()]
-            matches = [
-                b for b in all_books
-                if all(t in f"{_normalize_search_string(b.title)} {_normalize_search_string(b.author or '')}" for t in q_tokens)
-            ]
+            matches = _filter_books_by_query(all_books, query_text)
             if not matches:
+                q_tokens = [_normalize_search_string(t) for t in query_text.split() if t.strip()]
                 matches = [
                     b for b in all_books
                     if any(t in _normalize_search_string(b.title) for t in q_tokens)
@@ -3406,9 +3466,9 @@ async def buddy_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return
             _clear_pending_command_prompt(update)
 
-            q_tokens = [_normalize_search_string(t) for t in query_str.split() if t.strip()]
-            matches = [b for b in all_books if all(t in f"{_normalize_search_string(b.title)} {_normalize_search_string(b.author or '')}" for t in q_tokens)]
+            matches = _filter_books_by_query(all_books, query_str)
             if not matches:
+                q_tokens = [_normalize_search_string(t) for t in query_str.split() if t.strip()]
                 matches = [b for b in all_books if any(t in _normalize_search_string(b.title) for t in q_tokens)]
 
             if not matches:

@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/backend \
     DATABASE_URL=sqlite+aiosqlite:////app/data/librosync.db \
+    SEED_DATABASE_PATH=/app/seed/librosync.db \
     STORAGE_DIR=/app/data/storage
 
 WORKDIR /app
@@ -20,9 +21,10 @@ COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Solo el código de la aplicación. Nunca .env, tests ni bases de datos.
+# Código de la aplicación y semilla inicial del catálogo (sin .env ni tests).
 COPY --chown=librosync:librosync backend/app /app/backend/app
-RUN mkdir -p /app/data/storage && chown -R librosync:librosync /app/data
+COPY --chown=librosync:librosync librosync.db /app/seed/librosync.db
+RUN mkdir -p /app/data/storage /app/seed && chown -R librosync:librosync /app/data /app/seed
 
 USER librosync
 
