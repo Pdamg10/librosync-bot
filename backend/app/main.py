@@ -11,6 +11,7 @@ logger = logging.getLogger("librosync")
 
 
 _bot_connected = False
+SERVICE_VERSION = "2026.11.12-download-timeout"
 
 
 async def handle_health_check(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -18,7 +19,8 @@ async def handle_health_check(reader: asyncio.StreamReader, writer: asyncio.Stre
     try:
         await reader.read(1024)
         body = (
-            f'{{"status":"ok","service":"librosync-bot","telegram_connected":{str(_bot_connected).lower()},'
+            f'{{"status":"ok","service":"librosync-bot","version":"{SERVICE_VERSION}",'
+            f'"telegram_connected":{str(_bot_connected).lower()},'
             f'"bot_username":"{settings.TELEGRAM_BOT_USERNAME}"}}'
         ).encode("utf-8")
         response = (
