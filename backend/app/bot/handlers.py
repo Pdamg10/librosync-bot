@@ -1561,6 +1561,73 @@ def _download_back_keyboard(token: str, page: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Volver a los resultados", callback_data=f"dlp:{token}:{max(1, page)}")]
     ])
 
+
+async def _edit_query_silently(query, text: str) -> None:
+    """Edita el mensaje sin interrumpir la operación si Telegram rechaza la edición."""
+    try:
+        await query.edit_message_text(text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def _heartbeat_until(query, stop_event: asyncio.Event, text_builder, interval_seconds: int) -> None:
+    """Refresca el mensaje cada N segundos para que el usuario vea que sigue trabajando."""
+    started = time.monotonic()
+    interval = max(2, int(interval_seconds))
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+        elapsed = int(time.monotonic() - started)
+        await _edit_query_silently(query, text_builder(elapsed))
+
+
+async def _stop_heartbeat(stop_event: asyncio.Event, task: asyncio.Task) -> None:
+    stop_event.set()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+async def _download_with_progress(query, title_safe: str, download_url: str, timeout_seconds=None):
+    """Descarga con plazo total y mensajes de progreso para evitar un 'cargando' infinito."""
+    timeout_seconds = max(
+        1,
+        int(timeout_seconds or settings.DOWNLOAD_TOTAL_TIMEOUT_SECONDS),
+    )
+    interval = max(2, int(settings.DOWNLOAD_PROGRESS_INTERVAL_SECONDS))
+    stop_event = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _heartbeat_until(
+            query,
+            stop_event,
+            lambda elapsed: (
+                f"⏳ <b>[1/3] Descargando:</b> <i>{title_safe}</i>...\n"
+                f"<i>{elapsed}s transcurridos. La fuente puede ser lenta; "
+                "si tarda demasiado, prueba otra variante (EPUB suele ser más rápido).</i>"
+            ),
+            interval,
+        )
+    )
+    try:
+        from app.services.book_download_service import download_book_bytes
+
+        return await asyncio.wait_for(
+            download_book_bytes(download_url), timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"La descarga superó {timeout_seconds}s. La fuente está muy lenta o el archivo "
+            "es demasiado grande; prueba otra opción o sube el archivo manualmente."
+        ) from exc
+    finally:
+        await _stop_heartbeat(stop_event, heartbeat)
+
 async def download_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Comando /descargar o /pedir o /download:
@@ -1789,21 +1856,61 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
     chosen_book = results[idx]
     title_safe = html.escape(chosen_book["title"])
     fmt = chosen_book.get("format", "epub").upper()
+
+    size_bytes = chosen_book.get("size_bytes")
+    if (
+        isinstance(size_bytes, int)
+        and not isinstance(size_bytes, bool)
+        and size_bytes > settings.max_download_size_bytes
+    ):
+        await query.edit_message_text(
+            f"⚠️ <b>El archivo es demasiado grande para Telegram.</b>\n\n"
+            f"📦 Peso: <b>{size_bytes / (1024 * 1024):.1f} MB</b> "
+            f"(límite: {settings.MAX_DOWNLOAD_SIZE_MB} MB).\n\n"
+            "Elige otra variante más liviana o sube el archivo manualmente al chat.",
+            parse_mode="HTML",
+            reply_markup=_download_back_keyboard(token, page),
+        )
+        return
+
     await query.edit_message_text(
         f"⏳ <b>[1/3] Descargando:</b> <i>{title_safe}</i> (<code>.{fmt}</code>)...\n"
         f"<i>Conectando al repositorio público y descargando archivo binario...</i>",
         parse_mode="HTML"
     )
 
-    from app.services.book_download_service import download_book_bytes, ingest_downloaded_book
+    from app.services.book_download_service import ingest_downloaded_book
     from app.services.book_processor import get_chat_lock
 
     async with get_chat_lock(chat.id):
-        # 1. Descargar bytes
+        # 1. Descargar bytes con plazo total y progreso visible
         try:
-            file_bytes, filename = await download_book_bytes(chosen_book["download_url"])
+            file_bytes, filename = await _download_with_progress(
+                query, title_safe, chosen_book["download_url"]
+            )
+        except TimeoutError as dl_timeout:
+            logger.warning(
+                "Timeout descargando %s desde %s: %s",
+                chosen_book.get("title"),
+                chosen_book.get("source"),
+                dl_timeout,
+            )
+            await query.edit_message_text(
+                f"⌛ <b>La descarga tardó demasiado.</b>\n\n"
+                f"{html.escape(str(dl_timeout))}\n\n"
+                "💡 Prueba otra variante de la lista (EPUB suele ser más rápido) "
+                "o sube el archivo manualmente al chat.",
+                parse_mode="HTML",
+                reply_markup=_download_back_keyboard(token, page),
+            )
+            return
         except Exception as dl_err:
-            logger.error(f"Error descargando libro desde {chosen_book['download_url']}: {dl_err}")
+            logger.error(
+                "Error descargando libro %s desde %s: %s",
+                chosen_book.get("title"),
+                chosen_book.get("download_url"),
+                dl_err,
+            )
             await query.edit_message_text(
                 f"❌ <b>Error al descargar el archivo:</b> {html.escape(str(dl_err)[:200])}",
                 parse_mode="HTML",
@@ -1835,6 +1942,20 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
                 )
                 return
 
+            stage2_stop = asyncio.Event()
+            stage2_task = asyncio.create_task(
+                _heartbeat_until(
+                    query,
+                    stage2_stop,
+                    lambda elapsed: (
+                        f"🧠 <b>[2/3] Analizando y archivando:</b> <i>{title_safe}</i>...\n"
+                        f"<i>{elapsed}s transcurridos. Clasificando con IA y subiendo el archivo a Telegram...</i>"
+                    ),
+                    max(3, int(settings.DOWNLOAD_PROGRESS_INTERVAL_SECONDS)),
+                )
+            )
+            ingest_res = None
+            ingest_error = None
             try:
                 ingest_res = await ingest_downloaded_book(
                     bot=context.bot,
@@ -1846,9 +1967,16 @@ async def download_callback_handler(update: Update, context: ContextTypes.DEFAUL
                     original_meta=chosen_book
                 )
             except Exception as ing_err:
-                logger.error(f"Error ingestando libro descargado: {ing_err}", exc_info=True)
+                ingest_error = ing_err
+            finally:
+                await _stop_heartbeat(stage2_stop, stage2_task)
+
+            if ingest_error is not None:
+                logger.error(
+                    "Error ingestando libro descargado: %s", ingest_error, exc_info=True
+                )
                 await query.edit_message_text(
-                    f"❌ <b>Error al archivar el libro:</b> {html.escape(str(ing_err)[:200])}",
+                    f"❌ <b>Error al archivar el libro:</b> {html.escape(str(ingest_error)[:200])}",
                     parse_mode="HTML",
                     reply_markup=_download_back_keyboard(token, page),
                 )

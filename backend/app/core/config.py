@@ -69,6 +69,8 @@ class Settings(BaseSettings):
 
     # Límites operativos
     MAX_DOWNLOAD_SIZE_MB: int = 48
+    DOWNLOAD_TOTAL_TIMEOUT_SECONDS: int = 90
+    DOWNLOAD_PROGRESS_INTERVAL_SECONDS: int = 8
     DOWNLOAD_CACHE_TTL_SECONDS: int = 7200
     SEARCH_RATE_LIMIT: int = 20
     SEARCH_RATE_WINDOW_SECONDS: int = 300

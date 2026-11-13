@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
@@ -302,6 +303,26 @@ async def test_download_reader_enforces_streaming_size_limit():
 
     with pytest.raises(ValueError):
         await _read_limited(ChunkedTooLarge(), 40)
+
+
+@pytest.mark.asyncio
+async def test_download_with_progress_aborts_when_source_stalls(monkeypatch):
+    """La descarga no debe quedar colgada indefinidamente si la fuente no responde."""
+    from app.bot import handlers
+    from app.services import book_download_service
+
+    async def stalled_download(url):
+        await asyncio.sleep(5)
+        return b"x" * 100, "x.epub"
+
+    monkeypatch.setattr(book_download_service, "download_book_bytes", stalled_download)
+    query = MagicMock()
+    query.edit_message_text = AsyncMock()
+
+    with pytest.raises(TimeoutError):
+        await handlers._download_with_progress(
+            query, "Libro lento", "https://example.org/x.epub", timeout_seconds=1
+        )
 
 
 def test_book_identity_distinguishes_author_and_format():
