@@ -341,3 +341,110 @@ def test_migrations_are_versioned_and_idempotent():
         )]
     engine.dispose()
     assert versions == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_my_books_handler_with_co_readers_and_dedup_buddy_reads(session, monkeypatch):
+    from app.bot import handlers
+    from app.services.buddy_read_service import create_buddy_read, join_buddy_read, update_member_progress
+    from app.services.book_sync_service import deduplicate_library_for_chat
+
+    @asynccontextmanager
+    async def session_ctx():
+        yield session
+
+    monkeypatch.setattr(handlers, "AsyncSessionLocal", session_ctx)
+
+    link = await _make_link(session, chat_id=-100444555, user_id=1)
+    user1 = await session.get(User, 1)
+    user1.telegram_user_id = 1001
+    user2 = User(id=2, nombre="Ana Lectora", telegram_user_id=1002)
+    session.add(user2)
+    await session.commit()
+
+    b_canon = Book(
+        user_id=1, title="El Nombre del Viento", author="Patrick Rothfuss",
+        genre="Fantasía", telegram_link_id=link.id, telegram_message_id=101, file_format="epub",
+    )
+    b_dup = Book(
+        user_id=1, title="el nombre del viento", author="patrick rothfuss",
+        genre="General", telegram_link_id=link.id, telegram_message_id=102, file_format="epub",
+    )
+    session.add_all([b_canon, b_dup])
+    await session.commit()
+
+    br1 = await create_buddy_read(session, b_canon.id, user1, telegram_link_id=link.id)
+    await join_buddy_read(session, br1.id, user2)
+    await update_member_progress(session, br1.id, user1.id, 30.0)
+    await update_member_progress(session, br1.id, user2.id, 55.0)
+
+    # También crear lectura conjunta en el duplicado con el mismo usuario y progreso mayor
+    br2 = await create_buddy_read(session, b_dup.id, user1, telegram_link_id=link.id)
+    await update_member_progress(session, br2.id, user1.id, 75.0)
+
+    # 1. Verificar /mislibros con co-lectores activos (sin AttributeError en User)
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    bot.delete_message = AsyncMock()
+    update = MagicMock(
+        effective_message=MagicMock(message_thread_id=None),
+        effective_chat=MagicMock(id=link.chat_id, type="supergroup"),
+        effective_user=MagicMock(id=1001, first_name="User 1", last_name="", username="user1"),
+    )
+    await handlers.my_books_handler(update, MagicMock(bot=bot, args=[]))
+    assert bot.send_message.called
+    shelves_text = bot.send_message.call_args.kwargs["text"]
+    assert "Ana Lectora" in shelves_text
+    assert "El Nombre del Viento" in shelves_text
+
+    # 2. Verificar que deduplicación fusiona BuddyReads sin MissingGreenlet ni IntegrityError
+    dedup_res = await deduplicate_library_for_chat(bot, session, link.id, link.chat_id)
+    assert dedup_res["duplicates_removed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_private_chat_search_and_info_scope_and_supported_formats(session, monkeypatch):
+    from app.bot import handlers
+    from app.services.book_processor import SUPPORTED_EXTENSIONS
+
+    for ext in (".pdf", ".epub", ".mobi", ".azw3", ".cbr", ".cbz"):
+        assert ext in SUPPORTED_EXTENSIONS
+
+    @asynccontextmanager
+    async def session_ctx():
+        yield session
+
+    monkeypatch.setattr(handlers, "AsyncSessionLocal", session_ctx)
+
+    user = User(id=50, nombre="Lector Privado", telegram_user_id=5050)
+    priv_link = TelegramLink(
+        id=50, user_id=50, chat_id=5050, chat_type="private",
+        chat_title="Biblioteca Personal", bot_is_admin=True, forum_enabled=False,
+    )
+    book = Book(
+        user_id=50, title="Watchmen", author="Alan Moore",
+        genre="Novela Gráfica", file_format="cbz", publication_year="1986",
+        series_type="Autoconclusivo",
+    )
+    session.add_all([user, priv_link, book])
+    await session.commit()
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    update = MagicMock(
+        effective_message=MagicMock(message_thread_id=None, reply_to_message=None),
+        effective_chat=MagicMock(id=5050, type="private"),
+        effective_user=MagicMock(id=5050, first_name="Lector"),
+    )
+
+    # /buscar en chat privado encuentra libro asociado al user_id
+    await handlers.search_handler(update, MagicMock(bot=bot, args=["Watchmen"]))
+    assert bot.send_message.called
+    assert "Watchmen" in bot.send_message.call_args.kwargs["text"]
+
+    # /info en chat privado encuentra libro asociado al user_id
+    bot.send_message.reset_mock()
+    await handlers.info_handler(update, MagicMock(bot=bot, args=["Watchmen"]))
+    assert bot.send_message.called
+    assert "Alan Moore" in bot.send_message.call_args.kwargs["text"]
+

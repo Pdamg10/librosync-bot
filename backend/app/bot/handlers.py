@@ -58,19 +58,20 @@ def _rate_limit_reply_text(retry_after: float) -> str:
     )
 
 
+def _book_scope_filter(link: TelegramLink):
+    """Filtro de alcance de libros según el tipo de chat (privado vs grupo)."""
+    if link.chat_type == "private":
+        return or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
+    return Book.telegram_link_id == link.id
+
+
 async def _get_book_in_chat_scope(
     session,
     link: TelegramLink,
     book_id: int,
 ) -> Optional[Book]:
     """Carga un libro solo si pertenece a la biblioteca del chat actual."""
-    stmt = select(Book).where(Book.id == book_id)
-    if link.chat_type == "private":
-        stmt = stmt.where(
-            or_(Book.telegram_link_id == link.id, Book.user_id == link.user_id)
-        )
-    else:
-        stmt = stmt.where(Book.telegram_link_id == link.id)
+    stmt = select(Book).where(Book.id == book_id, _book_scope_filter(link))
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
@@ -1127,7 +1128,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stmt_books = (
             select(Book)
             .options(selectinload(Book.telegram_link))
-            .where(Book.telegram_link_id == link.id)
+            .where(_book_scope_filter(link))
             .order_by(Book.title.asc())
         )
         b_res = await session.execute(stmt_books)
@@ -1228,7 +1229,7 @@ async def search_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             stmt_books = (
                 select(Book)
                 .options(selectinload(Book.telegram_link))
-                .where(Book.telegram_link_id == link.id)
+                .where(_book_scope_filter(link))
                 .order_by(Book.title.asc())
             )
             b_res = await session.execute(stmt_books)
@@ -2046,7 +2047,7 @@ async def topics_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         t_res = await session.execute(stmt_topics)
         topics = t_res.scalars().all()
 
-        stmt_books = select(Book).where(Book.telegram_link_id == link.id)
+        stmt_books = select(Book).where(_book_scope_filter(link))
 
         b_res = await session.execute(stmt_books)
         all_books = b_res.scalars().all()
@@ -2456,7 +2457,7 @@ async def rename_book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 conditions.append(Book.telegram_message_id == linked_msg_id)
 
             stmt_book = select(Book).where(
-                Book.telegram_link_id == link.id,
+                _book_scope_filter(link),
                 or_(*conditions)
             )
             b_res = await session.execute(stmt_book)
@@ -2468,7 +2469,7 @@ async def rename_book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if t_match:
                     card_title = t_match.group(1).strip()
                     stmt_fallback = select(Book).where(
-                        Book.telegram_link_id == link.id,
+                        _book_scope_filter(link),
                         Book.title == card_title
                     )
                     book = (await session.execute(stmt_fallback)).scalars().first()
@@ -2785,6 +2786,39 @@ async def lost_book_callback_handler(update: Update, context: ContextTypes.DEFAU
                     original_meta=best
                 )
 
+                # Reasignar estados de lectura y lecturas conjuntas al nuevo registro antes de borrar el antiguo
+                new_book_id = ingest_res.get("book_id")
+                if new_book_id and new_book_id != b.id:
+                    rs_rows = (
+                        await session.execute(
+                            select(ReadingState).where(ReadingState.book_id == b.id)
+                        )
+                    ).scalars().all()
+                    for rs in rs_rows:
+                        existing_rs = (
+                            await session.execute(
+                                select(ReadingState).where(
+                                    ReadingState.book_id == new_book_id,
+                                    ReadingState.user_id == rs.user_id,
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        if existing_rs:
+                            if (rs.progress_percent or 0) > (existing_rs.progress_percent or 0):
+                                existing_rs.progress_percent = rs.progress_percent
+                                existing_rs.current_page = rs.current_page
+                            await session.delete(rs)
+                        else:
+                            rs.book_id = new_book_id
+
+                    br_rows = (
+                        await session.execute(
+                            select(BuddyRead).where(BuddyRead.book_id == b.id)
+                        )
+                    ).scalars().all()
+                    for br in br_rows:
+                        br.book_id = new_book_id
+
                 # Eliminar el registro antiguo huérfano para evitar duplicidad
                 await session.delete(b)
                 await session.commit()
@@ -2842,7 +2876,7 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stmt_books = (
             select(Book)
             .options(selectinload(Book.telegram_link))
-            .where(Book.telegram_link_id == link.id)
+            .where(_book_scope_filter(link))
         )
         all_books = (await session.execute(stmt_books)).scalars().all()
 
@@ -3129,7 +3163,7 @@ async def buddy_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("❌ Este chat no está vinculado a una biblioteca.", parse_mode="HTML")
             return
 
-        stmt_books = select(Book).options(selectinload(Book.telegram_link)).where(Book.telegram_link_id == link.id)
+        stmt_books = select(Book).options(selectinload(Book.telegram_link)).where(_book_scope_filter(link))
         all_books = (await session.execute(stmt_books)).scalars().all()
 
         target_book = None
@@ -3308,7 +3342,12 @@ async def my_books_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for br in active_buddy_reads:
             b_title = html.escape(br.book.title if br.book else "Libro")
             co_members = [
-                html.escape(m.user.display_name or m.user.username or f"Lector {m.user_id}")
+                html.escape(
+                    m.telegram_name
+                    or (m.user.nombre if m.user else None)
+                    or m.telegram_username
+                    or f"Lector {m.user_id}"
+                )
                 for m in br.members if m.user_id != user_db.id
             ]
             if co_members:
@@ -3573,6 +3612,7 @@ async def buddy_read_callback_handler(update: Update, context: ContextTypes.DEFA
                 select(BuddyRead)
                 .options(selectinload(BuddyRead.members), selectinload(BuddyRead.book).selectinload(Book.telegram_link))
                 .where(BuddyRead.id == bid)
+                .execution_options(populate_existing=True)
             )
             return (await session.execute(stmt_reload)).scalar_one()
 

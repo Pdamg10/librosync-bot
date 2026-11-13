@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import BadRequest
 from app.models.book import Book
@@ -120,17 +121,36 @@ async def deduplicate_library_for_chat(
                     rs.book_id = canonical.id
 
             # 3. Reasignar BuddyReads de forma segura
-            br_stmt = select(BuddyRead).where(BuddyRead.book_id == dup.id)
+            br_stmt = (
+                select(BuddyRead)
+                .options(selectinload(BuddyRead.members))
+                .where(BuddyRead.book_id == dup.id)
+            )
             br_list = (await session.execute(br_stmt)).scalars().all()
             for br in br_list:
-                c_br_stmt = select(BuddyRead).where(
-                    BuddyRead.book_id == canonical.id,
-                    BuddyRead.status == "active"
+                c_br_stmt = (
+                    select(BuddyRead)
+                    .options(selectinload(BuddyRead.members))
+                    .where(
+                        BuddyRead.book_id == canonical.id,
+                        BuddyRead.telegram_link_id == br.telegram_link_id,
+                        BuddyRead.status == "active",
+                    )
                 )
-                c_br = (await session.execute(c_br_stmt)).scalar_one_or_none()
-                if c_br:
-                    for m in br.members:
-                        m.buddy_read_id = c_br.id
+                c_br = (await session.execute(c_br_stmt)).scalars().first()
+                if c_br and c_br.id != br.id:
+                    existing_member_map = {cm.user_id: cm for cm in c_br.members}
+                    for m in list(br.members):
+                        if m.user_id in existing_member_map:
+                            cm = existing_member_map[m.user_id]
+                            if (m.progress_percent or 0) > (cm.progress_percent or 0):
+                                cm.progress_percent = m.progress_percent
+                                cm.current_page = m.current_page
+                        else:
+                            br.members.remove(m)
+                            m.buddy_read_id = c_br.id
+                            c_br.members.append(m)
+                    await session.flush()
                     await session.delete(br)
                 else:
                     br.book_id = canonical.id

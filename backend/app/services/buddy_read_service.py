@@ -259,6 +259,8 @@ async def join_buddy_read(
         await update_user_book_state(session, user.id, br.book_id, status="reading")
 
     await session.commit()
+    if br:
+        await session.refresh(br, ["members"])
     await session.refresh(new_member)
     return new_member, True
 

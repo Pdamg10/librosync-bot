@@ -14,10 +14,14 @@ from sqlalchemy import select
 from app.models.book import Book
 from app.models.telegram_link import TelegramLink
 from app.models.topic import Topic
-from app.services.topic_resolver import resolve_or_create_topic, normalize_genre_slug
+from app.services.topic_resolver import (
+    resolve_or_create_topic,
+    normalize_genre_slug,
+    delete_topic_by_thread_id,
+)
 from app.services.ai_classifier import classify_book_with_gemini, get_genre_emoji
 from app.services.metadata_extractor import extract_internal_book_metadata, is_generic_or_cryptic_filename
-from app.services.telegram_service import send_book_document
+from app.services.telegram_service import send_book_document, ThreadNotFoundError
 from app.services.series_formatter import format_book_full_description
 from app.services.book_identity import book_identity_key
 
@@ -1376,14 +1380,35 @@ async def ingest_downloaded_book(
     clean_file_obj = io.BytesIO(file_bytes)
     clean_file_obj.name = build_book_filename(title, author, ext)
 
-    sent_msg = await send_book_document(
-        bot=bot,
-        chat_id=chat_id,
-        document=clean_file_obj,
-        filename=clean_file_obj.name,
-        caption=caption_text,
-        topic_id=topic_id
-    )
+    try:
+        sent_msg = await send_book_document(
+            bot=bot,
+            chat_id=chat_id,
+            document=clean_file_obj,
+            filename=clean_file_obj.name,
+            caption=caption_text,
+            topic_id=topic_id
+        )
+    except ThreadNotFoundError:
+        if topic_id is not None:
+            await delete_topic_by_thread_id(session, link.id, topic_id)
+        topic_id = await resolve_or_create_topic(
+            session=session,
+            bot=bot,
+            telegram_link=link,
+            genre=genre,
+            suggested_emoji=suggested_emoji
+        )
+        clean_file_obj = io.BytesIO(file_bytes)
+        clean_file_obj.name = build_book_filename(title, author, ext)
+        sent_msg = await send_book_document(
+            bot=bot,
+            chat_id=chat_id,
+            document=clean_file_obj,
+            filename=clean_file_obj.name,
+            caption=caption_text,
+            topic_id=topic_id
+        )
 
     doc_info = getattr(sent_msg, "document", None)
     new_book = Book(

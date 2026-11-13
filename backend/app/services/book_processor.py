@@ -16,7 +16,7 @@ from app.services.book_identity import book_identity_key
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = [".pdf", ".epub", ".mobi"]
+SUPPORTED_EXTENSIONS = [".pdf", ".epub", ".mobi", ".azw3", ".cbr", ".cbz"]
 _chat_locks: Dict[int, asyncio.Lock] = {}
 
 def get_chat_lock(chat_id: int) -> asyncio.Lock:
