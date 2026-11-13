@@ -2,8 +2,8 @@
 aiosqlite==0.22.1
 beautifulsoup4==4.15.0
 httpx==0.28.1
-pydantic==2.13.5
-pydantic-settings==2.15.0
-pypdf==6.18.0
+pydantic==2.14.3
+pydantic-settings==2.16.2
+pypdf==7.0.1
 python-telegram-bot==22.8
-SQLAlchemy==2.0.52
+SQLAlchemy==2.1.8
