@@ -75,6 +75,55 @@ async def _get_book_in_chat_scope(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+_PENDING_COMMAND_TTL_SECONDS = 5 * 60
+_pending_command_prompts: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+
+def _set_pending_command_prompt(update: Update, command_name: str) -> None:
+    """Registra que el usuario invocó un comando sin argumentos y se espera su respuesta en texto."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    user = update.effective_user
+    uid = int(user.id) if user and getattr(user, "id", None) is not None else 0
+    now = time.time()
+    for k, v in list(_pending_command_prompts.items()):
+        if now - float(v.get("created", 0)) > _PENDING_COMMAND_TTL_SECONDS:
+            _pending_command_prompts.pop(k, None)
+    _pending_command_prompts[(int(chat.id), uid)] = {
+        "command": command_name,
+        "created": now,
+    }
+
+
+def _clear_pending_command_prompt(update: Update) -> None:
+    """Limpia cualquier estado de comando interactivo pendiente para este usuario/chat."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    user = update.effective_user
+    uid = int(user.id) if user and getattr(user, "id", None) is not None else 0
+    _pending_command_prompts.pop((int(chat.id), uid), None)
+
+
+def _pop_pending_command_prompt(update: Update) -> Optional[str]:
+    """Extrae y consume el comando pendiente para el usuario en este chat si no ha expirado."""
+    chat = update.effective_chat
+    if not chat:
+        return None
+    user = update.effective_user
+    uid = int(user.id) if user and getattr(user, "id", None) is not None else 0
+    now = time.time()
+    entry = _pending_command_prompts.pop((int(chat.id), uid), None)
+    if not entry and uid != 0:
+        entry = _pending_command_prompts.pop((int(chat.id), 0), None)
+    if not entry:
+        return None
+    if now - float(entry.get("created", 0)) > _PENDING_COMMAND_TTL_SECONDS:
+        return None
+    return str(entry.get("command") or "") or None
+
+
 async def _get_or_create_link(bot, session, chat_id: int, effective_user=None) -> Optional[TelegramLink]:
     """
     Obtiene el vínculo existente para un chat.
@@ -1077,9 +1126,11 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_query = " ".join(context.args).strip() if context.args else ""
 
     if not raw_query:
+        _set_pending_command_prompt(update, "buscar")
         help_search = (
             "🔍 <b>Búsqueda en la Biblioteca Digital:</b>\n\n"
-            "Escribe el nombre del libro o autor que deseas encontrar.\n\n"
+            "Escribe a continuación el nombre del libro o autor que deseas encontrar "
+            "(o usa <code>/buscar &lt;título o autor&gt;</code>).\n\n"
             "<b>Ejemplos de uso:</b>\n"
             "• <code>/buscar Cecelia Ahern</code> — <i>Muestra todos sus libros</i>\n"
             "• <code>/buscar El Gran Gatsby</code> — <i>Busca por título</i>\n"
@@ -1100,6 +1151,8 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
         return
+
+    _clear_pending_command_prompt(update)
 
     import time
     import hashlib
@@ -1524,9 +1577,11 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
     raw_query = re.sub(r"[\x00-\x1f\x7f]", " ", raw_query).strip()[:200]
 
     if not raw_query:
+        _set_pending_command_prompt(update, "descargar")
         help_dl = (
             "📥 <b>Búsqueda y Descarga de Libros:</b>\n\n"
-            "Escribe el nombre del libro o autor que deseas descargar en EPUB o PDF.\n\n"
+            "Escribe a continuación el nombre del libro o autor que deseas descargar en EPUB o PDF "
+            "(o usa <code>/descargar &lt;título o autor&gt;</code>).\n\n"
             "<b>Ejemplos de uso:</b>\n"
             "• <code>/descargar El Principito</code>\n"
             "• <code>/descargar Don Quijote</code>\n"
@@ -1538,6 +1593,8 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             await context.bot.send_message(chat_id=chat.id, text=help_dl, parse_mode="HTML")
         return
+
+    _clear_pending_command_prompt(update)
 
     # Solo se descarga en bibliotecas ya vinculadas (o en el chat privado del dueño).
     async with AsyncSessionLocal() as session:
@@ -1593,10 +1650,10 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
 
     try:
         results = await asyncio.wait_for(
-            search_external_books(raw_query, max_results=14), timeout=13.0
+            search_external_books(raw_query, max_results=14), timeout=15.0
         )
     except asyncio.TimeoutError:
-        logger.warning(f"Timeout de 13s en /descargar para '{raw_query}'")
+        logger.warning(f"Timeout de 15s en /descargar para '{raw_query}'")
         results = []
     except Exception as e:
         logger.error(f"Error buscando libros externos: {e}")
@@ -1617,7 +1674,10 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
         try:
             await status_msg.edit_text(no_res, parse_mode="HTML")
         except Exception:
-            pass
+            try:
+                await context.bot.send_message(chat_id=chat.id, message_thread_id=thread_id, text=no_res, parse_mode="HTML")
+            except Exception:
+                await context.bot.send_message(chat_id=chat.id, text=no_res, parse_mode="HTML")
         return
 
     token = secrets.token_urlsafe(8)
@@ -1630,12 +1690,31 @@ async def download_command_handler(update: Update, context: ContextTypes.DEFAULT
     }
 
     text, keyboard = build_download_results_page(raw_query, results, token, page=1)
-    await status_msg.edit_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    try:
+        await status_msg.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=thread_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
 
 
 async def download_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2909,13 +2988,11 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target_book:
             query_text = " ".join(context.args).strip() if context.args else ""
             if not query_text:
+                _set_pending_command_prompt(update, "info")
                 help_text = (
                     "ℹ️ <b>Información Detallada de Libros y Sagas:</b>\n\n"
-                    "Consulta si un libro pertenece a una saga o trilogía, si tiene continuación, "
-                    "cuáles libros le siguen o están antes, y si están en algún tema de la biblioteca.\n\n"
-                    "<b>Formas de uso:</b>\n"
-                    "• <code>/info &lt;título del libro&gt;</code>\n"
-                    "• Responde a cualquier libro o ficha con <code>/info</code>\n\n"
+                    "Escribe a continuación el título del libro que deseas consultar, "
+                    "o responde a cualquier libro con <code>/info</code>.\n\n"
                     "<b>Ejemplos:</b>\n"
                     "• <code>/info Bad Ash</code>\n"
                     "• <code>/info Harry Potter</code>\n"
@@ -2932,6 +3009,7 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     await context.bot.send_message(chat_id=chat.id, text=help_text, parse_mode="HTML")
                 return
+            _clear_pending_command_prompt(update)
 
             q_tokens = [_normalize_search_string(t) for t in query_text.split() if t.strip()]
             matches = [
@@ -3188,17 +3266,17 @@ async def buddy_read_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not target_book:
             query_str = " ".join(context.args).strip() if context.args else ""
             if not query_str:
+                _set_pending_command_prompt(update, "leerjuntos")
                 help_br = (
                     "📖 <b>Lecturas Conjuntas:</b>\n\n"
-                    "Lee un libro junto a otros miembros del club y compartan su avance en tiempo real.\n\n"
-                    "<b>Formas de uso:</b>\n"
-                    "• Responde a cualquier libro con <code>/leerjuntos</code>\n"
-                    "• <code>/leerjuntos &lt;nombre del libro&gt;</code>\n\n"
+                    "Escribe a continuación el nombre del libro que deseas leer en conjunto, "
+                    "o responde a cualquier libro con <code>/leerjuntos</code>.\n\n"
                     "<b>Ejemplo:</b>\n"
                     "• <code>/leerjuntos El Gran Gatsby</code>"
                 )
                 await message.reply_text(help_br, parse_mode="HTML")
                 return
+            _clear_pending_command_prompt(update)
 
             q_tokens = [_normalize_search_string(t) for t in query_str.split() if t.strip()]
             matches = [b for b in all_books if all(t in f"{_normalize_search_string(b.title)} {_normalize_search_string(b.author or '')}" for t in q_tokens)]
@@ -3844,6 +3922,51 @@ async def reorganize_command_handler(update: Update, context: ContextTypes.DEFAU
             "💡 <i>Nota: Si el mensaje original fue publicado por el creador del grupo, la API de Telegram no permite borrarlo; se creó la copia en su tema correspondiente.</i>",
             parse_mode="HTML"
         )
+
+
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Captura respuestas en texto plano cuando el usuario acaba de tocar un comando
+    interactivo sin argumentos desde el menú de Telegram (/descargar, /buscar, /info, /leerjuntos)
+    o cuando responde directamente al mensaje de instrucción del bot.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    raw_text = (getattr(message, "text", None) or "").strip()
+    if not raw_text or raw_text.startswith("/"):
+        return
+
+    cmd = _pop_pending_command_prompt(update)
+
+    # También permitir responder (Reply) directamente al mensaje de instrucción del bot
+    if not cmd and getattr(message, "reply_to_message", None):
+        reply_text = getattr(message.reply_to_message, "text", None) or ""
+        if isinstance(reply_text, str):
+            if "Búsqueda y Descarga de Libros" in reply_text:
+                cmd = "descargar"
+            elif "Búsqueda en la Biblioteca Digital" in reply_text:
+                cmd = "buscar"
+            elif "Información Detallada de Libros" in reply_text:
+                cmd = "info"
+            elif "Lecturas Conjuntas:" in reply_text:
+                cmd = "leerjuntos"
+
+    if not cmd:
+        return
+
+    context.args = raw_text.split()
+    if cmd == "descargar":
+        await download_command_handler(update, context)
+    elif cmd == "buscar":
+        await search_handler(update, context)
+    elif cmd == "info":
+        await info_handler(update, context)
+    elif cmd == "leerjuntos":
+        await buddy_read_handler(update, context)
+
 
 
 

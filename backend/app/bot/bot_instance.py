@@ -50,6 +50,7 @@ from app.bot.handlers import (
     lost_book_callback_handler,
     setup_mode_callback_handler,
     code_exp_callback_handler,
+    text_message_handler,
 )
 
 
@@ -133,6 +134,9 @@ def get_bot_application() -> Application:
 
         # Ingesta de libros
         _bot_application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+
+        # Respuesta conversacional tras comandos sin argumentos (/descargar, /buscar, /info, /leerjuntos)
+        _bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
 
         # Evento de unión o promoción del bot en grupos
         _bot_application.add_handler(ChatMemberHandler(chat_member_update_handler, ChatMemberHandler.MY_CHAT_MEMBER))

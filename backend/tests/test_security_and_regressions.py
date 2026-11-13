@@ -448,3 +448,88 @@ async def test_private_chat_search_and_info_scope_and_supported_formats(session,
     assert bot.send_message.called
     assert "Alan Moore" in bot.send_message.call_args.kwargs["text"]
 
+
+@pytest.mark.asyncio
+async def test_download_conversational_followup_and_options_rendering(session, monkeypatch):
+    from app.bot import handlers
+    from app.services import book_download_service
+
+    @asynccontextmanager
+    async def session_ctx():
+        yield session
+
+    monkeypatch.setattr(handlers, "AsyncSessionLocal", session_ctx)
+    await _make_link(session, chat_id=-100888999, user_id=1)
+
+    fake_results = [
+        {
+            "source": "Internet Archive",
+            "title": "El Principito",
+            "author": "Antoine de Saint-Exupéry",
+            "year": "1943",
+            "language": "Español",
+            "format": "epub",
+            "filename": "El_Principito.epub",
+            "size_bytes": 1500000,
+            "size_str": "1.4 MB",
+            "download_url": "https://archive.org/download/elprincipito/El_Principito.epub",
+            "identifier": "elprincipito",
+        },
+        {
+            "source": "Library Genesis",
+            "title": "El Principito",
+            "author": "Antoine de Saint-Exupéry",
+            "year": "1943",
+            "language": "Español",
+            "format": "pdf",
+            "filename": "El_Principito.pdf",
+            "size_bytes": 2200000,
+            "size_str": "2.1 MB",
+            "download_url": "https://libgen.is/ads.php?md5=0123456789abcdef0123456789abcdef",
+            "identifier": "libgen_0123456789abcdef0123456789abcdef",
+            "is_libgen": True,
+        },
+    ]
+
+    async def fake_search_external_books(query: str, max_results: int = 10, limit=None):
+        assert query == "El Principito"
+        return fake_results
+
+    monkeypatch.setattr(book_download_service, "search_external_books", fake_search_external_books)
+
+    status_msg = MagicMock()
+    status_msg.edit_text = AsyncMock()
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=status_msg)
+
+    chat = MagicMock(id=-100888999, type="supergroup")
+    user = MagicMock(id=777, first_name="Lector")
+
+    # Paso 1: El usuario pulsa /descargar desde el menú (sin argumentos)
+    msg_cmd = MagicMock(message_thread_id=None, text="/descargar", reply_to_message=None)
+    update_cmd = MagicMock(effective_message=msg_cmd, effective_chat=chat, effective_user=user)
+    await handlers.download_command_handler(update_cmd, MagicMock(bot=bot, args=[]))
+
+    assert bot.send_message.await_count == 1
+    assert "Búsqueda y Descarga de Libros" in bot.send_message.call_args.kwargs["text"]
+
+    # Paso 2: El usuario escribe el nombre del libro como mensaje normal
+    msg_txt = MagicMock(message_thread_id=None, text="El Principito", reply_to_message=None)
+    update_txt = MagicMock(effective_message=msg_txt, effective_chat=chat, effective_user=user)
+    await handlers.text_message_handler(update_txt, MagicMock(bot=bot, args=[]))
+
+    # Se debió editar el mensaje de búsqueda mostrando la lista de libros y los botones de descarga
+    assert status_msg.edit_text.await_count == 1
+    rendered_text = status_msg.edit_text.call_args.args[0]
+    rendered_kb = status_msg.edit_text.call_args.kwargs["reply_markup"]
+    assert "Libros disponibles para descargar" in rendered_text
+    assert "El Principito" in rendered_text
+    button_callbacks = [
+        btn.callback_data
+        for row in rendered_kb.inline_keyboard
+        for btn in row
+    ]
+    assert any(cb.startswith("dl:") and cb.endswith(":0") for cb in button_callbacks)
+    assert any(cb.startswith("dl:") and cb.endswith(":1") for cb in button_callbacks)
+
+

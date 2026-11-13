@@ -335,7 +335,9 @@ def extract_title_language(raw_title: Any) -> Tuple[str, Optional[str]]:
 
 
 async def _fetch_archive_files(
-    client: httpx.AsyncClient, identifier: str
+    client: httpx.AsyncClient,
+    identifier: str,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Obtiene las variantes EPUB/PDF de un item de Internet Archive.
@@ -369,38 +371,44 @@ async def _fetch_archive_files(
         if not current or size > int(current.get("size", 0) or 0):
             best[fmt] = {"name": clean_name, "size": size, "format": fmt}
 
-    # 1. Listado HTML del directorio (rápido y con tamaños).
-    try:
-        from bs4 import BeautifulSoup
-        resp = await client.get(f"https://archive.org/download/{identifier}/", timeout=5.0)
-        if resp.status_code == 200 and "directory-listing-table" in resp.text:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for row in soup.select("table.directory-listing-table tr"):
-                link = row.find("a", href=True)
-                if not link:
-                    continue
-                tds = row.find_all("td")
-                size_text = tds[2].get_text(strip=True) if len(tds) >= 3 else ""
-                _consider(link["href"], parse_libgen_size(size_text))
-            if any(best.values()):
-                return best
-    except Exception as e:
-        logger.debug(f"Listado de Internet Archive falló para {identifier}: {e}")
+    async def _run_queries() -> Dict[str, Optional[Dict[str, Any]]]:
+        # 1. Listado HTML del directorio (rápido y con tamaños).
+        try:
+            from bs4 import BeautifulSoup
+            resp = await client.get(f"https://archive.org/download/{identifier}/", timeout=4.5)
+            if resp.status_code == 200 and "directory-listing-table" in resp.text:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for row in soup.select("table.directory-listing-table tr"):
+                    link = row.find("a", href=True)
+                    if not link:
+                        continue
+                    tds = row.find_all("td")
+                    size_text = tds[2].get_text(strip=True) if len(tds) >= 3 else ""
+                    _consider(link["href"], parse_libgen_size(size_text))
+                if any(best.values()):
+                    return best
+        except Exception as e:
+            logger.debug(f"Listado de Internet Archive falló para {identifier}: {e}")
 
-    # 2. Respaldo: listado JSON de archivos del item.
-    try:
-        resp = await client.get(f"https://archive.org/metadata/{identifier}/files", timeout=3.5)
-        if resp.status_code == 200:
-            for f in resp.json().get("result", []):
-                try:
-                    size = int(f.get("size", 0) or 0)
-                except (ValueError, TypeError):
-                    size = 0
-                _consider(f.get("name", ""), size, f.get("format", ""))
-    except Exception as e:
-        logger.debug(f"Metadatos de archivos fallaron para {identifier}: {e}")
+        # 2. Respaldo: listado JSON de archivos del item.
+        try:
+            resp = await client.get(f"https://archive.org/metadata/{identifier}/files", timeout=4.0)
+            if resp.status_code == 200:
+                for f in resp.json().get("result", []):
+                    try:
+                        size = int(f.get("size", 0) or 0)
+                    except (ValueError, TypeError):
+                        size = 0
+                    _consider(f.get("name", ""), size, f.get("format", ""))
+        except Exception as e:
+            logger.debug(f"Metadatos de archivos fallaron para {identifier}: {e}")
 
-    return best
+        return best
+
+    if sem is not None:
+        async with sem:
+            return await _run_queries()
+    return await _run_queries()
 
 
 async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -421,14 +429,26 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
             "format", "downloads", "collection", "access-restricted-item",
         ],
         "sort[]": "downloads desc",
-        "rows": str(limit + 4),
+        "rows": str(min(limit + 3, 10)),
         "output": "json"
     }
 
     try:
-        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True, headers=HTTP_HEADERS) as client:
-            resp = await client.get(ia_search_url, params=params)
-            if resp.status_code != 200:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=HTTP_HEADERS) as client:
+            resp = None
+            for attempt in range(2):
+                try:
+                    resp = await client.get(
+                        ia_search_url,
+                        params=params,
+                        timeout=5.5 if attempt == 0 else 7.0,
+                    )
+                    if resp.status_code == 200:
+                        break
+                except httpx.TimeoutException:
+                    if attempt == 1:
+                        raise
+            if resp is None or resp.status_code != 200:
                 return results
 
             data = resp.json()
@@ -467,8 +487,9 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
                 return rank, -downloads
 
             docs.sort(key=_relevance)
+            ia_sem = asyncio.Semaphore(4)
 
-            # Inspección concurrente de archivos en paralelo para no bloquear el bot
+            # Inspección concurrente controlada de archivos en paralelo para no saturar archive.org
             async def _inspect_doc(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
                 identifier = doc.get("identifier")
                 if not identifier:
@@ -490,7 +511,7 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
                     return []
 
                 try:
-                    best_files = await _fetch_archive_files(client, identifier)
+                    best_files = await _fetch_archive_files(client, identifier, sem=ia_sem)
                     variants: List[Dict[str, Any]] = []
                     for fmt_clean in ("epub", "pdf"):
                         chosen = best_files.get(fmt_clean)
@@ -523,7 +544,7 @@ async def search_internet_archive(query: str, limit: int = 5) -> List[Dict[str, 
                     )
                     return []
 
-            tasks = [_inspect_doc(doc) for doc in docs[: limit + 4]]
+            tasks = [_inspect_doc(doc) for doc in docs[: min(len(docs), max(5, limit + 1))]]
             doc_results = await asyncio.gather(*tasks, return_exceptions=True)
             for doc_variants in doc_results:
                 if isinstance(doc_variants, list):
@@ -549,15 +570,16 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
         return results
 
     ol_url = "https://openlibrary.org/search.json"
-    params = {"q": raw_terms, "limit": str(limit + 5)}
+    params = {"q": raw_terms, "limit": str(min(limit + 3, 6))}
 
     try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, headers=HTTP_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True, headers=HTTP_HEADERS) as client:
             resp = await client.get(ol_url, params=params)
             if resp.status_code != 200:
                 return results
 
             docs = resp.json().get("docs", [])
+            ol_sem = asyncio.Semaphore(2)
 
             async def _inspect_ol_doc(d: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # Filtrar estrictamente solo libros de acceso público real (no DRM ni préstamo borrowable)
@@ -586,8 +608,8 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
                 try:
                     best_ia = ""
                     best_files: Dict[str, Optional[Dict[str, Any]]] = {}
-                    for candidate_id in candidate_ids[:3]:
-                        files = await _fetch_archive_files(client, candidate_id)
+                    for candidate_id in candidate_ids[:2]:
+                        files = await _fetch_archive_files(client, candidate_id, sem=ol_sem)
                         if any(files.values()):
                             best_ia = candidate_id
                             best_files = files
@@ -620,7 +642,7 @@ async def search_open_library(query: str, limit: int = 3) -> List[Dict[str, Any]
                 except Exception:
                     return []
 
-            tasks = [_inspect_ol_doc(d) for d in docs[: limit + 6]]
+            tasks = [_inspect_ol_doc(d) for d in docs[: min(len(docs), 4)]]
             doc_results = await asyncio.gather(*tasks, return_exceptions=True)
             for doc_variants in doc_results:
                 if isinstance(doc_variants, list):
@@ -827,7 +849,11 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     async def _query_mirror(mirror: str) -> List[Dict[str, Any]]:
         m_results: List[Dict[str, Any]] = []
         try:
-            async with httpx.AsyncClient(timeout=2.5, headers=LIBGEN_HEADERS, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(6.5, connect=3.0),
+                headers=LIBGEN_HEADERS,
+                follow_redirects=True,
+            ) as client:
                 resp = await client.get(f"{mirror}/index.php", params=params)
                 if resp.status_code != 200:
                     return m_results
@@ -923,13 +949,21 @@ async def search_libgen(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             pass
         return m_results
 
-    active_mirrors = ["https://libgen.is", "https://libgen.li"]
-    tasks = [_query_mirror(m) for m in active_mirrors]
-    mirror_res = await asyncio.gather(*tasks, return_exceptions=True)
-    for r in mirror_res:
-        if isinstance(r, list) and r:
-            results.extend(r)
-            break
+    active_mirrors = ["https://libgen.li", "https://libgen.is"]
+    mirror_tasks = [asyncio.create_task(_query_mirror(m)) for m in active_mirrors]
+    try:
+        for completed in asyncio.as_completed(mirror_tasks):
+            try:
+                r = await completed
+                if isinstance(r, list) and r:
+                    results.extend(r)
+                    break
+            except Exception:
+                continue
+    finally:
+        for t in mirror_tasks:
+            if not t.done():
+                t.cancel()
 
     return results
 
@@ -945,7 +979,7 @@ async def search_external_books(query: str, max_results: int = 10, limit: Option
       distintos autores y el mismo autor con distintos libros.
     """
     effective_limit = max(1, limit if limit is not None else max_results)
-    source_limit = max(3, min(effective_limit, 10))
+    source_limit = max(3, min(effective_limit, 6))
 
     async def _safe_search(coro, timeout_sec: float) -> List[Dict[str, Any]]:
         try:
@@ -956,9 +990,9 @@ async def search_external_books(query: str, max_results: int = 10, limit: Option
 
     results_group = await asyncio.gather(
         _safe_search(search_internet_archive(query, limit=source_limit), 12.5),
-        _safe_search(search_open_library(query, limit=min(source_limit, 5)), 6.5),
-        _safe_search(search_project_gutenberg(query, limit=min(source_limit, 5)), 6.0),
-        _safe_search(search_libgen(query, limit=source_limit), 3.0),
+        _safe_search(search_open_library(query, limit=min(source_limit, 4)), 8.0),
+        _safe_search(search_project_gutenberg(query, limit=min(source_limit, 5)), 7.0),
+        _safe_search(search_libgen(query, limit=source_limit), 7.5),
         return_exceptions=True,
     )
 
